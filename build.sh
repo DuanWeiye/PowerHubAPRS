@@ -47,21 +47,26 @@ BIN_NAME="m5power.bin"
 
 FLASH_PORT=""
 
+# AtomS3R 稳定设备 ID（ESP32-S3 内置 USB-JTAG，MAC 固定 → by-id 路径不随枚举顺序变）。
+# -f 不带参数时用它，避免误刷到 ttyACM0/ttyUSB* 上的其它设备（如 M5Paper）。
+ATOMS3R_DEV="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_1C:DB:D4:A8:27:C4-if00"
+
 # ── Parse arguments ────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f)
-            if [[ -z "$2" ]]; then
-                echo "ERROR: -f requires a port argument (e.g. -f /dev/ttyACM0)"
-                exit 1
+            # 端口可选：不给（或下一个又是选项）则用写死的 AtomS3R ID
+            if [[ -n "$2" && "$2" != -* ]]; then
+                FLASH_PORT="$2"; shift 2
+            else
+                FLASH_PORT="$ATOMS3R_DEV"; shift 1
             fi
-            FLASH_PORT="$2"
-            shift 2
             ;;
         -h|--help)
-            echo "Usage: $0 [-f <port>]"
+            echo "Usage: $0 [-f [port]]"
             echo "  (no args)   Build only"
-            echo "  -f <port>   Build then flash to device"
+            echo "  -f          Build then flash to the fixed AtomS3R device ID"
+            echo "  -f <port>   Build then flash to an explicit port"
             exit 0
             ;;
         *)

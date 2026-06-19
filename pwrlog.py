@@ -67,9 +67,23 @@ def parse_block(txt):
     rows = []
     for l in lines[start + 1:end]:
         parts = l.split(",")
-        if len(parts) == 9 and parts[0].isdigit():
-            rows.append([int(x) for x in parts])
+        # 旧布局 9 列 (无 GNSS)，新布局 12 列 (+cn0,gnss,sats)
+        if len(parts) in (9, 12) and parts[0].isdigit():
+            vals = [int(x) for x in parts]
+            if len(vals) == 9:
+                vals += [0, 0, 0]   # 补 cn0,gnss,sats 占位，兼容旧固件
+            rows.append(vals)
     return rows
+
+
+# gnss 位掩码 → 星座缩写；高 2 位是天线状态
+_GNSS_BITS = ["GPS", "GLO", "BDS", "GAL", "QZSS", "SBAS"]
+_ANT = {0: "?", 1: "OK", 2: "OPEN", 3: "SHORT"}
+
+def decode_gnss(mask):
+    sysmask = mask & 0x3F
+    syss = "+".join(n for i, n in enumerate(_GNSS_BITS) if sysmask & (1 << i)) or "-"
+    return syss, _ANT[(mask >> 6) & 0x03]
 
 
 def main():
@@ -102,11 +116,13 @@ def main():
     stamp = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
     csv_path = os.path.join(os.path.expanduser(args.outdir), f"pwrlog_{stamp}.csv")
     with open(csv_path, "w") as f:
-        f.write("idx,epoch,iso_utc,mv,ma,pct,ext,chg,fix,catm\n")
+        f.write("idx,epoch,iso_utc,mv,ma,pct,ext,chg,fix,catm,cn0,gnss,sats,systems,antenna\n")
         for r in rows:
             iso = (datetime.datetime.fromtimestamp(r[1], datetime.timezone.utc)
                    .strftime("%Y-%m-%dT%H:%M:%SZ") if r[1] > 0 else "")
-            f.write(f"{r[0]},{r[1]},{iso},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]}\n")
+            syss, ant = decode_gnss(r[10])
+            f.write(f"{r[0]},{r[1]},{iso},{r[2]},{r[3]},{r[4]},{r[5]},{r[6]},{r[7]},{r[8]},"
+                    f"{r[9]},{r[10]},{r[11]},{syss},{ant}\n")
 
     n = len(rows)
     span = rows[-1][1] - rows[0][1] if rows[0][1] and rows[-1][1] else 0
@@ -129,6 +145,26 @@ def main():
             print(f"NOTE    : {len(zeros)} battery samples near 0 mA — possible sleep/shutdown")
     else:
         print("battery : none (was on external power the whole time — run on battery to measure draw)")
+
+    # ── GNSS 信号摘要 ────────────────────────────────────────────────────────
+    cn0s = [r[9] for r in rows if r[9] > 0]
+    if cn0s:
+        sysset = set()
+        for r in rows:
+            syss, _ = decode_gnss(r[10])
+            if syss != "-":
+                sysset.update(syss.split("+"))
+        ants = set(decode_gnss(r[10])[1] for r in rows if r[10] >> 6)
+        best = max(cn0s)
+        peak_sats = max((r[11] for r in rows), default=0)
+        fixrows = [r for r in rows if r[7] == 1]
+        print(f"gnss    : systems seen = {'+'.join(s for s in _GNSS_BITS if s in sysset) or '-'}"
+              f"   QZSS={'YES' if 'QZSS' in sysset else 'no'}")
+        print(f"        : best CN0 {best} dBHz, avg-of-peaks {sum(cn0s)/len(cn0s):.0f}, "
+              f"max sats-in-view {peak_sats}, antenna {'/'.join(sorted(ants)) or '?'}")
+        print(f"        : fix held {len(fixrows)}/{n} samples ({100*len(fixrows)/n:.0f}%)")
+    else:
+        print("gnss    : no GSV/CN0 captured (old firmware, or no sky view the whole time)")
 
     try:
         import matplotlib
