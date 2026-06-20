@@ -5,8 +5,9 @@
 // config.h 已被 .gitignore 忽略，不会泄露你的服务器信息。
 #pragma once
 
-#define CATM_APN     "your.apn"                        // SIM 卡 APN，如 "povo.jp"
+#define CATM_APN     "your.apn"                        // SIM 卡 APN（运营商提供，如 "iot.example"）
 #define SERVER_HOST  "your-server.example.com"         // 服务器域名（TLS SNI / Host）
 #define SERVER_PORT  443                               // 服务器端口
 #define SERVER_BASE  "https://your-server.example.com"
 #define PATH_APRS    "/a"                              // 接收 APRS 点位的后端路径
+#define PATH_TIME    "/t"                              // 对时端点（GET 返回服务器时间）

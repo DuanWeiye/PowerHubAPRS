@@ -281,7 +281,7 @@ enum CatmState : uint8_t {
 static CatmState catmState      = CM_OFF;
 static bool      catmReady      = false;
 static uint8_t   catmFailStreak = 0;       // consecutive sendGpsData failures (0 on success)
-static bool      catmTimeSynced = false;   // true after first successful /iot/time sync
+static bool      catmTimeSynced = false;   // true after first successful time sync
 static bool      edrxChecked    = false;   // one-shot: read granted eDRX cycle after attach
 static uint32_t  tLastSend      = 0;
 static uint32_t  tLastCatmRecover = 0;   // 红灯且无 GPS 定位时的恢复重试计时器（与 beacon 节奏的 tLastSend 互不干扰）
@@ -1040,8 +1040,8 @@ static bool catmSyncTime() {
     }
     Serial.println("[CM] SyncTime: connected");
 
-    // GET /iot/time  → {"ts":<epoch>,"str":"yyyy/mm/dd hh:mm:ss"}
-    String ret = catmCmd("AT+SHREQ=\"/iot/time\",1", 15000);
+    // GET PATH_TIME（对时端点）→ {"ts":<epoch>,"str":"yyyy/mm/dd hh:mm:ss"}
+    String ret = catmCmd("AT+SHREQ=\"" PATH_TIME "\",1", 15000);
     int code = 0, bodyLen = 0;
     int ci = ret.indexOf("\"GET\",");
     if (ci >= 0) {
