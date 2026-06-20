@@ -2,8 +2,16 @@
 # build.sh — M5Stack PowerHub firmware build & flash
 #
 # Usage:
-#   ./build.sh              # build only
-#   ./build.sh -f /dev/ttyACM0   # build + flash
+#   ./build.sh                        # build only
+#   ./build.sh -f [port]              # build + flash
+#   ./build.sh -w [port]              # flash an existing .bin only (no build)
+#   ./build.sh -w --bin <file> [port] # flash a specific .bin (no build)
+#
+# Flash-only (-w) does NOT rebuild — it writes an already-compiled .bin straight
+# to the device. Default bin is ./m5power.bin (app partition only @0x10000, for
+# re-flashing the same partition scheme). If the chosen .bin sits next to a full
+# image set (bootloader.bin + partitions.bin + boot_app0.bin, as in
+# releases/configA/), -w writes the whole set instead — a full restore.
 #
 # Board note:
 #   M5Stack arduino-esp32 2.1.4 has no dedicated PowerHub profile.
@@ -46,6 +54,8 @@ OUT_DIR="$SCRIPT_DIR"
 BIN_NAME="m5power.bin"
 
 FLASH_PORT=""
+DO_BUILD=1        # -w 关掉它：跳过编译，直接刷已有 .bin
+BIN_OVERRIDE=""   # --bin 指定要刷的 .bin（默认 $OUT_DIR/$BIN_NAME）
 
 # AtomS3R 稳定设备 ID（ESP32-S3 内置 USB-JTAG，MAC 固定 → by-id 路径不随枚举顺序变）。
 # -f 不带参数时用它，避免误刷到 ttyACM0/ttyUSB* 上的其它设备（如 M5Paper）。
@@ -62,11 +72,28 @@ while [[ $# -gt 0 ]]; do
                 FLASH_PORT="$ATOMS3R_DEV"; shift 1
             fi
             ;;
+        -w)
+            # flash-only：跳过编译，直接刷已有 .bin（端口同 -f，可选）
+            DO_BUILD=0
+            if [[ -n "$2" && "$2" != -* ]]; then
+                FLASH_PORT="$2"; shift 2
+            else
+                FLASH_PORT="$ATOMS3R_DEV"; shift 1
+            fi
+            ;;
+        --bin)
+            if [[ -z "$2" || "$2" == -* ]]; then
+                echo "ERROR: --bin needs a file path"; exit 1
+            fi
+            BIN_OVERRIDE="$2"; shift 2
+            ;;
         -h|--help)
-            echo "Usage: $0 [-f [port]]"
-            echo "  (no args)   Build only"
-            echo "  -f          Build then flash to the fixed AtomS3R device ID"
-            echo "  -f <port>   Build then flash to an explicit port"
+            echo "Usage: $0 [-f [port]] | [-w [--bin <file>] [port]]"
+            echo "  (no args)            Build only"
+            echo "  -f [port]            Build then flash (full image) to AtomS3R / given port"
+            echo "  -w [port]            Flash existing ./m5power.bin only (no build, app @0x10000)"
+            echo "  -w --bin <file> [p]  Flash a specific .bin (no build); full restore if a"
+            echo "                       complete image set sits next to it (see releases/configA/)"
             exit 0
             ;;
         *)
@@ -79,43 +106,73 @@ done
 
 mkdir -p "$BUILD_DIR"
 
-# ── Build ──────────────────────────────────────────────────────────────────
-echo "=== Building M5Power firmware ==="
-echo "    FQBN: $FQBN"
-echo "    Sketch: $SKETCH"
+# ── Build (skipped with -w) ─────────────────────────────────────────────────
+if [[ $DO_BUILD -eq 1 ]]; then
+    echo "=== Building M5Power firmware ==="
+    echo "    FQBN: $FQBN"
+    echo "    Sketch: $SKETCH"
 
-"$ARDUINO" \
-    --board "$FQBN" \
-    --pref "build.path=$BUILD_DIR" \
-    --verify \
-    "$SKETCH"
+    "$ARDUINO" \
+        --board "$FQBN" \
+        --pref "build.path=$BUILD_DIR" \
+        --verify \
+        "$SKETCH"
 
-# ── Copy output ───────────────────────────────────────────────────────────
-BIN_SRC="$BUILD_DIR/firmware.ino.bin"
-if [[ ! -f "$BIN_SRC" ]]; then
-    echo "ERROR: expected binary not found: $BIN_SRC"
-    exit 1
+    # ── Copy output ─────────────────────────────────────────────────────────
+    BIN_SRC="$BUILD_DIR/firmware.ino.bin"
+    if [[ ! -f "$BIN_SRC" ]]; then
+        echo "ERROR: expected binary not found: $BIN_SRC"
+        exit 1
+    fi
+
+    cp "$BIN_SRC" "$OUT_DIR/$BIN_NAME"
+    SIZE=$(stat -c%s "$OUT_DIR/$BIN_NAME")
+    echo "=== Build done: $OUT_DIR/$BIN_NAME  (${SIZE} bytes) ==="
 fi
-
-cp "$BIN_SRC" "$OUT_DIR/$BIN_NAME"
-SIZE=$(stat -c%s "$OUT_DIR/$BIN_NAME")
-echo "=== Build done: $OUT_DIR/$BIN_NAME  (${SIZE} bytes) ==="
 
 # ── Flash (optional) ──────────────────────────────────────────────────────
 if [[ -n "$FLASH_PORT" ]]; then
-    echo ""
-    echo "=== Flashing to $FLASH_PORT ==="
+    # 要刷的 app .bin：--bin 优先，否则仓库根目录的 m5power.bin
+    APP_BIN="${BIN_OVERRIDE:-$OUT_DIR/$BIN_NAME}"
+    if [[ ! -f "$APP_BIN" ]]; then
+        echo "ERROR: app binary not found: $APP_BIN"
+        exit 1
+    fi
 
-    BOOTLOADER="$BUILD_DIR/firmware.ino.bootloader.bin"
-    PARTITIONS="$BUILD_DIR/firmware.ino.partitions.bin"
+    # 找配套的 bootloader/分区/boot_app0：
+    #   -f（刚编译）：用 /tmp 构建产物
+    #   -w（不编译）：找 app .bin 同目录的整套镜像（releases/configA/ 风格）
     BOOT_APP="$HOME/.arduino15/packages/m5stack/hardware/esp32/2.1.4/tools/partitions/boot_app0.bin"
-
-    for f in "$BOOTLOADER" "$PARTITIONS" "$BOOT_APP"; do
-        if [[ ! -f "$f" ]]; then
-            echo "ERROR: required file missing: $f"
-            exit 1
+    BOOTLOADER=""; PARTITIONS=""
+    if [[ $DO_BUILD -eq 1 ]]; then
+        BOOTLOADER="$BUILD_DIR/firmware.ino.bootloader.bin"
+        PARTITIONS="$BUILD_DIR/firmware.ino.partitions.bin"
+    else
+        BIN_DIR="$(cd "$(dirname "$APP_BIN")" && pwd)"
+        if [[ -f "$BIN_DIR/bootloader.bin" && -f "$BIN_DIR/partitions.bin" ]]; then
+            BOOTLOADER="$BIN_DIR/bootloader.bin"
+            PARTITIONS="$BIN_DIR/partitions.bin"
+            [[ -f "$BIN_DIR/boot_app0.bin" ]] && BOOT_APP="$BIN_DIR/boot_app0.bin"
         fi
-    done
+    fi
+
+    # 有整套镜像就完整刷；否则只覆盖 app 分区（分区方案不变时够用）
+    if [[ -n "$BOOTLOADER" && -f "$BOOTLOADER" && -n "$PARTITIONS" && -f "$PARTITIONS" && -f "$BOOT_APP" ]]; then
+        echo ""
+        echo "=== Flashing FULL image to $FLASH_PORT ==="
+        echo "    app: $APP_BIN"
+        WRITE_ARGS=(
+            0x00000 "$BOOTLOADER"
+            0x08000 "$PARTITIONS"
+            0x0e000 "$BOOT_APP"
+            0x10000 "$APP_BIN"
+        )
+    else
+        echo ""
+        echo "=== Flashing APP ONLY to $FLASH_PORT ==="
+        echo "    app: $APP_BIN  (@0x10000，假定分区方案未变)"
+        WRITE_ARGS=( 0x10000 "$APP_BIN" )
+    fi
 
     python3 "$ESPTOOL" \
         --chip    esp32s3 \
@@ -128,10 +185,7 @@ if [[ -n "$FLASH_PORT" ]]; then
         --flash_mode  dio \
         --flash_freq  80m \
         --flash_size  8MB \
-        0x00000 "$BOOTLOADER" \
-        0x08000 "$PARTITIONS" \
-        0x0e000 "$BOOT_APP" \
-        0x10000 "$OUT_DIR/$BIN_NAME"
+        "${WRITE_ARGS[@]}"
 
     echo "=== Flash done ==="
 fi
