@@ -1353,17 +1353,28 @@ static void trackFlush() {
     static char body[1024];
     uint8_t batches = 0;
     while (trackCount > 0 && batches < TRACK_FLUSH_BATCHES) {
-        uint16_t take = trackCount < TRACK_BATCH ? trackCount : TRACK_BATCH;
+        uint16_t want = trackCount < TRACK_BATCH ? trackCount : TRACK_BATCH;
         uint16_t tail = (trackHead - trackCount + TRACK_QUEUE_CAP) % TRACK_QUEUE_CAP;
-        int pos = 0;
+        int      pos  = 0;
+        uint16_t take = 0;               // 实际放进本批的点数（可能 < want）
         body[pos++] = '[';
-        for (uint16_t i = 0; i < take; i++) {
+        for (uint16_t i = 0; i < want; i++) {
             const TrackPoint& p = trackQueue[(tail + i) % TRACK_QUEUE_CAP];
-            if (i) body[pos++] = ',';
-            pos += fmtPoint(body + pos, sizeof(body) - pos - 2, p);
+            char one[160];
+            int  n = fmtPoint(one, sizeof(one), p);   // 单点必然 < 160，n 为真实长度
+            // 需要的空间 = 可能的逗号 + 本点 + 结尾 ']' + '\0'。放不下就留到下一批，
+            // 绝不截断坐标（保持 %.7f 精度），也绝不越界写 body。
+            // （旧写法 pos += fmtPoint(...) 用 snprintf 的"应写长度"，截断时会把 pos
+            //   推过缓冲尾，随后写 ']'/'\0' 越界——这里改为先量后拷，从根上杜绝。）
+            int need = (take ? 1 : 0) + n + 2;
+            if (pos + need > (int)sizeof(body)) break;
+            if (take) body[pos++] = ',';
+            memcpy(body + pos, one, n); pos += n;
+            take++;
         }
         body[pos++] = ']';
         body[pos]   = 0;
+        if (take == 0) return;           // 连一个点都塞不下（不应发生）→ 不发空数组
 
         if (!catmCheckNet()) { Serial.println("[Q] flush: net gone — keep queued"); return; }
         int code = catmPostBody(body, pos, 1024);

@@ -26,10 +26,9 @@
 ```bash
 # 完整刷回配置A（bootloader+分区+app），刷到写死的 AtomS3R 设备 ID
 ./build.sh -w --bin releases/configA/m5power.bin
-
-# 指定端口
-./build.sh -w --bin releases/configA/m5power.bin /dev/ttyACM0
 ```
+
+> 刷机目标设备已在 `build.sh` 里写死（AtomS3R 的 by-id 路径），不接受端口参数。
 
 只想快速覆盖 app 分区（分区方案不变时最常用，不重编译）：
 

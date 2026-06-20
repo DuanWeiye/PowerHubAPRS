@@ -2,10 +2,13 @@
 # build.sh — M5Stack PowerHub firmware build & flash
 #
 # Usage:
-#   ./build.sh                        # build only
-#   ./build.sh -f [port]              # build + flash
-#   ./build.sh -w [port]              # flash an existing .bin only (no build)
-#   ./build.sh -w --bin <file> [port] # flash a specific .bin (no build)
+#   ./build.sh                    # build only
+#   ./build.sh -f                 # build + flash
+#   ./build.sh -w                 # flash an existing .bin only (no build)
+#   ./build.sh -w --bin <file>    # flash a specific .bin (no build)
+#
+# 刷机目标设备写死为下面的 ATOMS3R_DEV（by-id 路径，稳定不随枚举变），不接受端口
+# 参数，从根上避免误刷到 ttyACM0/ttyUSB* 上的其它板子。多带的端口参数会被忽略。
 #
 # Flash-only (-w) does NOT rebuild — it writes an already-compiled .bin straight
 # to the device. Default bin is ./m5power.bin (app partition only @0x10000, for
@@ -58,28 +61,18 @@ DO_BUILD=1        # -w 关掉它：跳过编译，直接刷已有 .bin
 BIN_OVERRIDE=""   # --bin 指定要刷的 .bin（默认 $OUT_DIR/$BIN_NAME）
 
 # AtomS3R 稳定设备 ID（ESP32-S3 内置 USB-JTAG，MAC 固定 → by-id 路径不随枚举顺序变）。
-# -f 不带参数时用它，避免误刷到 ttyACM0/ttyUSB* 上的其它设备（如 M5Paper）。
+# 刷机目标写死为它：-f/-w 都只刷这一台，避免误刷到 ttyACM0/ttyUSB* 上的其它设备（如 M5Paper）。
 ATOMS3R_DEV="/dev/serial/by-id/usb-Espressif_USB_JTAG_serial_debug_unit_1C:DB:D4:A8:27:C4-if00"
 
 # ── Parse arguments ────────────────────────────────────────────────────────
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -f)
-            # 端口可选：不给（或下一个又是选项）则用写死的 AtomS3R ID
-            if [[ -n "$2" && "$2" != -* ]]; then
-                FLASH_PORT="$2"; shift 2
-            else
-                FLASH_PORT="$ATOMS3R_DEV"; shift 1
-            fi
+            FLASH_PORT="$ATOMS3R_DEV"; shift 1     # 目标写死，不取端口参数
             ;;
         -w)
-            # flash-only：跳过编译，直接刷已有 .bin（端口同 -f，可选）
-            DO_BUILD=0
-            if [[ -n "$2" && "$2" != -* ]]; then
-                FLASH_PORT="$2"; shift 2
-            else
-                FLASH_PORT="$ATOMS3R_DEV"; shift 1
-            fi
+            DO_BUILD=0                              # flash-only：跳过编译，直接刷已有 .bin
+            FLASH_PORT="$ATOMS3R_DEV"; shift 1     # 目标写死，不取端口参数
             ;;
         --bin)
             if [[ -z "$2" || "$2" == -* ]]; then
@@ -88,18 +81,25 @@ while [[ $# -gt 0 ]]; do
             BIN_OVERRIDE="$2"; shift 2
             ;;
         -h|--help)
-            echo "Usage: $0 [-f [port]] | [-w [--bin <file>] [port]]"
-            echo "  (no args)            Build only"
-            echo "  -f [port]            Build then flash (full image) to AtomS3R / given port"
-            echo "  -w [port]            Flash existing ./m5power.bin only (no build, app @0x10000)"
-            echo "  -w --bin <file> [p]  Flash a specific .bin (no build); full restore if a"
-            echo "                       complete image set sits next to it (see releases/configA/)"
+            echo "Usage: $0 [-f] | [-w [--bin <file>]]"
+            echo "  (no args)        Build only"
+            echo "  -f               Build then flash (full image) to the hardcoded AtomS3R"
+            echo "  -w               Flash existing ./m5power.bin only (no build, app @0x10000)"
+            echo "  -w --bin <file>  Flash a specific .bin (no build); full restore if a"
+            echo "                   complete image set sits next to it (see releases/configA/)"
+            echo "  注：刷机目标设备已写死，不接受端口参数"
             exit 0
             ;;
         *)
-            echo "Unknown argument: $1"
-            echo "Run '$0 --help' for usage."
-            exit 1
+            # 设备 ID 写死后端口参数已无意义：误带的端口（不以 - 开头）直接忽略；
+            # 但拼错的选项（以 - 开头）仍报错，免得静默刷错 bin。
+            if [[ "$1" == -* ]]; then
+                echo "Unknown option: $1"
+                echo "Run '$0 --help' for usage."
+                exit 1
+            fi
+            echo "Note: 忽略多余参数 '$1'（刷机设备已写死，无需端口）"
+            shift 1
             ;;
     esac
 done
