@@ -115,7 +115,7 @@ static bool sendGpsData(bool queueOnFail) {
         catmState = CM_ERR;
         refreshCatmLed();
         catmFailStreak++;
-        if (queueOnFail) trackEnqueue(cur);
+        if (queueOnFail) flashLogAppend(cur);   // 发失败(无信号) → 落 Flash 段日志(断电不丢)
         return false;
     }
 
@@ -134,12 +134,12 @@ static bool sendGpsData(bool queueOnFail) {
         delay(2000);              // brief green confirmation flash
         catmState = CM_READY;     // back to blue = idle / network ready
         refreshCatmLed();
-        trackFlush();             // network is up — push any backlog
+        flashLogUpload();         // 网络恢复 → 立刻把 Flash 积压全部补发（A 独立蜂窝，不怕 GPS 失明）
     } else {
         catmFailStreak++;
         catmState = CM_ERR;       // red — stays until the next attempt
         refreshCatmLed();
-        if (queueOnFail) trackEnqueue(cur);
+        if (queueOnFail) flashLogAppend(cur);   // 发失败(无信号) → 落 Flash 段日志(断电不丢)
     }
     return ok;
 }
@@ -151,7 +151,7 @@ static bool sendGpsData(bool queueOnFail) {
 // setup：CatM UART 之后 → 开 PORT.C 的 GPS 串口 + 一次性配置 GPS 模块。
 static void configSetupEarly() {
     // ── GPS serial ───────────────────────────────────────────────────────────
-    gpsSerial.setRxBufferSize(2048);   // larger buffer: send() can block ~20s
+    gpsSerial.setRxBufferSize(4096);   // 大缓冲：发包/恢复补发会阻塞，吸收期间的 NMEA（~40s 余量）
     gpsSerial.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     Serial.println("[GPS] UART1 started — 115200 8N1");
 
@@ -250,10 +250,9 @@ static void configLoopRecover(uint32_t now) {
         // 正常但 SHCONN 发不出，会把红灯清掉却一条没发出去（静默丢数据）——
         // 2026-06-19 实测坐实。改成：只有积压点「真的发出去了」（队列变短）才清红；
         // 没有积压可发时无法验证 SH 是否真通，红灯保持到下次成功发送，绝不假装恢复。
-        if (trackCount > 0) {
-            uint16_t before = trackCount;
-            trackFlush();             // catmPostBody 会在 SH 锁死时 CFUN=1,1 自愈后重发
-            if (trackCount < before) {
+        uint32_t pts; flashLogCounts(nullptr, &pts);
+        if (pts > 0) {
+            if (flashLogUpload() > 0) {   // catmSHOpen 内含 SH 锁 CFUN=1,1 自愈；只有真发出去才清红
                 Serial.println("[CM] recover (no fix): 积压补发成功 -> 清红");
                 catmState = CM_READY;
                 refreshCatmLed();
@@ -268,6 +267,17 @@ static void configLoopRecover(uint32_t now) {
 static void configOnTopShortPress() {
     Serial.println("[BTN] top button short press → request GPS upload");
     manualSendReq = true;
+}
+
+// 到 beacon 点的动作（配置A：实时直发，与改造前完全一致）。
+static void configBeaconAction() { sendGpsData(true); }
+
+// 长按大按钮（配置A：bench 诊断——忽略定位强发一包，原行为）。
+static void configForceUpload() {
+    Serial.println("[CM] === FORCED bench upload (long-press, ignoring GPS fix) ===");
+    sendGpsData(false);          // bench/diagnostic：不污染轨迹队列
+    recordAnchor();
+    decayInterval = DECAY_START_MS;
 }
 
 #endif  // !GNSS_TIMESHARE

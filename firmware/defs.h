@@ -9,6 +9,7 @@
 // 注意：本头需在 GNSS_TIMESHARE 与 config.h 之后被 include（见 firmware.ino 顶部顺序）。
 #pragma once
 #include <Arduino.h>
+#include "flushlogic.h"   // 配置B 存转日志的共享常量 + flushDue()（无 Arduino 依赖）
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Hardware constants
@@ -107,10 +108,9 @@ static const uint16_t PWRLOG_CAP        = 450;      // ring → ~15 h window at 
 static const uint8_t  CATM_FAIL_REATTACH = 3;       // consecutive send fails → CFUN re-attach
 static const uint32_t CATM_FAIL_RETRY_MS = 60000UL; // after a failed send, retry this soon
 
-// ── Store-and-forward track queue ─────────────────────────────────────────────
-static const uint16_t TRACK_QUEUE_CAP    = 1000;    // RAM ring of unsent points (~20 KB)
-static const uint8_t  TRACK_BATCH        = 8;       // points per catch-up POST (body < BODYLEN 1024)
-static const uint8_t  TRACK_FLUSH_BATCHES = 3;      // max batches pushed per successful live send
+// ── Store-and-forward ─────────────────────────────────────────────────────────
+// 配置A/B 统一用 flashlog.ino 的 LittleFS 段日志做存转（断电不丢）。批量大小/段大小
+// 见 flushlogic.h 的 FL_BATCH / FL_SEG_POINTS / FL_BODYLEN。（旧的 RAM 环形队列已弃用。）
 
 // ── Adaptive beaconing (SmartBeaconing + decay) ───────────────────────────────
 // Tuned for WALKING-primary use, occasional bicycle, at most a 原付/moped later —
@@ -201,7 +201,7 @@ struct __attribute__((packed)) PwrLogEntry {
 #if GNSS_TIMESHARE
 // ── 配置B LCD 显示参数（Unit LCD 1.14"）──────────────────────────────────────
 static const uint32_t DISPLAY_ON_MS  = 30000;   // 短按/开机亮屏时长（30s）
-static const uint32_t LCD_DRAW_MS    = 1000;    // 亮屏时状态重绘周期
+static const uint32_t LCD_DRAW_MS    = 500;     // 亮屏时状态重绘周期（<1s：秒钟不漏跳）
 static const uint8_t  LCD_BRIGHTNESS = 110;     // 亮屏亮度（0-255）
 #endif
 
@@ -247,13 +247,14 @@ static bool   catmCheckNet();
 static void   catmDiagConn();
 static bool   catmSyncTime();
 static bool   catmSHRecover();
-static int    catmPostBody(const char* body, int bodyLen, int bodyCap);
+static bool   catmSHOpen(int bodyCap);                 // 开 HTTPS 会话（含撞锁 CFUN=1,1 自愈）
+static int    catmSHReq(const char* body, int bodyLen);// 在已开会话上发一个 POST
+static void   catmSHClose();                           // 关会话
+static int    catmPostBody(const char* body, int bodyLen, int bodyCap);  // 开+发+关（单发）
 
 // ── track.ino ──
 static int     fmtPoint(char* buf, int cap, const TrackPoint& p);
 static void    buildTrackPoint(TrackPoint& p);
-static void    trackEnqueue(const TrackPoint& p);
-static void    trackFlush();
 static void    recordAnchor();
 static bool    beaconDue(const char** why, bool* stopped);
 
@@ -292,11 +293,22 @@ static void configLoopFeed(uint32_t now);   // loop 顶：A=喂 GPS 解析 | B=�
 static void configLoopDisplay(uint32_t now);// B=LCD 超时息屏/重绘 | A=空
 static void configLoopPrePwrlog();          // 采样前：B=抓 NMEA 填 CN0/星座 | A=空
 static void configLoopSync(uint32_t now);   // A=对时重试+eDRX 回读 | B=空
-static void configLoopRecover(uint32_t now);// A=无定位红灯恢复 | B=红灯处理
+static void configLoopRecover(uint32_t now);// A=无定位红灯恢复 | B=flush 调度器（切LTE上传积压）
 static void configOnTopShortPress();        // 顶部按钮短按：A=请求上传 | B=亮/息屏开关
+static void configBeaconAction();           // 到 beacon 点的动作：A=直接发送 | B=记录到 Flash 段日志
+static void configForceUpload();            // 长按大按钮：A=bench 强制发一包 | B=强制 flush 积压
+
+// ── flashlog.ino（LittleFS 存转段日志，配置A/B 共用：A 失败兜底 / B 每点记录）──
+static void flashLogBegin();
+static void flashLogAppend(const TrackPoint& p);
+static void flashLogCounts(uint16_t* sealedSegs, uint32_t* totalPoints);
+static int  flashLogUpload();
 
 #if GNSS_TIMESHARE
-// ── config_b.ino 专有 ──
+// ── flashlog.ino / config_b.ino 专有 ──
+static void flashFlushViaLte(bool forced);  // 切 GNSS→LTE、上传所有封段、切回 GNSS
+static void flashLogFillTest(int n);        // 台面实测：灌 n 个假点（绕过 GPS 定位）
+static void flashLogClear();                // 台面实测：清空段日志
 static bool catmWaitReg(uint32_t timeoutMs);
 static void pollGnssIntoLiveFix();
 static void gnssSampleNmea();

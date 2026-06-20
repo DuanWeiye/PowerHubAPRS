@@ -39,7 +39,7 @@
 //             腾出 PORT.C 给 LCD。位置靠 CGNSINF 轮询；发包时 GNSS↔LTE 切换。
 //   0 = 配置A：PORT.C 独立 ATGM336H 连续 NMEA + PORT.A 的 SIM7080G 专做 4G。
 // 换硬件改这一个数即可；两套逻辑分别在 config_a.ino / config_b.ino，互不影响。
-#define GNSS_TIMESHARE 0
+#define GNSS_TIMESHARE 1
 
 // 部署配置（APN / 服务器域名·端口·路径）抽到 config.h，不提交到 git。
 // 首次编译前：复制 config.example.h 为 config.h 并填入自己的值。
@@ -120,7 +120,7 @@ static uint32_t  ledCache[8];          // tracks last written color per LED
 static CatmState catmState      = CM_OFF;
 static bool      catmReady      = false;
 static uint8_t   catmFailStreak = 0;       // consecutive sendGpsData failures (0 on success)
-static bool      catmTimeSynced = false;   // true after first successful /iot/time sync
+static bool      catmTimeSynced = false;   // true after first successful time sync
 static bool      edrxChecked    = false;   // one-shot: read granted eDRX cycle after attach
 static uint32_t  tLastSend      = 0;
 static uint32_t  tLastCatmRecover = 0;   // 红灯且无 GPS 定位时的恢复重试计时器（与 beacon 节奏的 tLastSend 互不干扰）
@@ -134,12 +134,9 @@ static double    lastTxCourse   = -1.0;   // course at last beacon (-1 = unknown
 static bool      haveAnchor     = false;  // false until the first beacon
 static uint32_t  decayInterval  = DECAY_START_MS;  // current stopped interval (grows)
 
-// ── Store-and-forward track queue ─────────────────────────────────────────────
-// 失败的 beacon 点存这里，下次成功发送时批量补发（最旧优先），住 RAM（整机重启即丢，
-// 属短期断网保险）。环形缓冲：满了覆盖最旧，永不溢出。
-static TrackPoint trackQueue[TRACK_QUEUE_CAP];
-static uint16_t   trackHead  = 0;     // next write slot
-static uint16_t   trackCount = 0;     // queued points (0..CAP)
+// ── Store-and-forward ─────────────────────────────────────────────────────────
+// 断网积压统一存到 flashlog.ino 的 LittleFS 段日志（断电不丢，配置A/B 共用）；
+// 计数等状态都在 flashlog.ino 内部维护，这里不再有 RAM 队列。
 
 // ── Power log (battery voltage/current history) ───────────────────────────────
 // 存 RTC 慢速内存，软/掉压/看门狗复位后仍在（整机断电 0xE0 才丢，那本身就是"已关机"信号）。
@@ -204,6 +201,9 @@ void setup() {
     Serial2.setRxBufferSize(4096);
     Serial2.begin(CATM_BAUD, SERIAL_8N1, CATM_RX_PIN, CATM_TX_PIN);
     Serial.println("[CM] UART2 started — 115200 8N1");
+
+    // 存转段日志（LittleFS，配置A/B 共用；断电不丢的积压存储）
+    flashLogBegin();
 
     // 配置相关早期初始化：A=开 GPS 串口+初始化模块 | B=起 LCD 显示进度
     configSetupEarly();
@@ -311,26 +311,19 @@ void loop() {
             Serial.println("[CM] manual upload skipped — no GPS fix");
         } else {
             Serial.println("[CM] manual upload (button)");
-            sendGpsData(true);
+            configBeaconAction();         // A=实时直发 | B=记录到 Flash（B 不会走到这）
             recordAnchor();               // treat as a beacon: reset anchor + timer
             decayInterval = DECAY_START_MS;
         }
     }
 
-    // ── CatM: forced bench upload (top-button long-press) ────────────────────
-    // Diagnostic only: runs the full sendGpsData() POST path even with no GPS
-    // fix, so the "CatM red only outdoors" failure can be reproduced on the
-    // bench. Coordinates will be whatever GPS last had (0,0 if never fixed).
+    // ── CatM: 长按大按钮 → 强制上传 ─────────────────────────────────────────────
+    // 配置A：bench 诊断（忽略定位强发一包，复现"红灯只在户外"）。
+    // 配置B：立即强制 flush Flash 积压（不等静止/无定位，主动选时机上传）。
     if (forceSendReq) {
         forceSendReq = false;
-        if (!catmReady) {
-            Serial.println("[CM] FORCED upload skipped — CatM not ready");
-        } else {
-            Serial.println("[CM] === FORCED bench upload (long-press, ignoring GPS fix) ===");
-            sendGpsData(false);   // bench/diagnostic: don't pollute the track queue
-            recordAnchor();
-            decayInterval = DECAY_START_MS;
-        }
+        if (!catmReady) Serial.println("[CM] 强制上传跳过 — CatM 未就绪");
+        else configForceUpload();
     }
 
     // 配置A：无定位红灯恢复 | 配置B：红灯处理（均不依赖定位）
@@ -355,7 +348,7 @@ void loop() {
             }
             Serial.printf("[CM] beacon (%s, next stopped=%lus)\n",
                           why, (unsigned long)(decayInterval / 1000));
-            sendGpsData(true);
+            configBeaconAction();   // A=实时直发 | B=记录到 Flash 段日志
         }
     }
 

@@ -353,8 +353,8 @@ static bool catmSyncTime() {
     }
     Serial.println("[CM] SyncTime: connected");
 
-    // GET /iot/time  → {"ts":<epoch>,"str":"yyyy/mm/dd hh:mm:ss"}
-    String ret = catmCmd("AT+SHREQ=\"/iot/time\",1", 15000);
+    // GET PATH_TIME（对时端点）→ {"ts":<epoch>,"str":"yyyy/mm/dd hh:mm:ss"}
+    String ret = catmCmd("AT+SHREQ=\"" PATH_TIME "\",1", 15000);
     int code = 0, bodyLen = 0;
     int ci = ret.indexOf("\"GET\",");
     if (ci >= 0) {
@@ -469,14 +469,14 @@ static bool catmSHRecover() {
     return reg && ip;
 }
 
-// Low-level HTTPS POST of a ready-made JSON body to PATH_APRS. Returns the HTTP
-// status code, or -1 on a connection/transport failure. Caller owns net-check,
-// LED/state and failure-count handling. Headers MUST be after SHCONN and SHCHEAD
-// before SHAHEAD, else +CME ERROR → no Content-Type → server can't parse → 400.
-// bodyCap = the SHCONF BODYLEN to set (>= bodyLen; SIM7080G max 1024).
-static int catmPostBody(const char* body, int bodyLen, int bodyCap) {
-    // SHCONF/SSL 配置 + SHCONN 建链；若首次 SHCONN 命中 SH 锁死（operation not
-    // allowed），CFUN=1,1 整模块重启后把整段重做一遍再连（见 catmSHRecover）。
+// 打开一个 HTTPS(SH)会话：SHCONF/SSL 配置 + SHCONN 建链。若首次 SHCONN 命中 SH
+// 锁死（operation not allowed），CFUN=1,1 整模块重启后把整段重做一遍再连（见
+// catmSHRecover）。成功（SHSTATE=1）返回 true。
+// ★会话复用：打开一次后可连发多次 catmSHReq，最后 catmSHClose 一次——这样上传一批
+//   积压只做一次 TLS 握手，而不是每 8 个点重建一次（实测每次握手 0.8~2.4s，是大批量
+//   上传的主要耗时；改造前 200 点要 30 次握手 ~75s）。bodyCap = SHCONF BODYLEN（≥单条
+//   body；SIM7080G 上限 1024），整个会话设一次即可。
+static bool catmSHOpen(int bodyCap) {
     bool connected = false;
     for (int attempt = 0; attempt < 2 && !connected; attempt++) {
         catmCmd("AT+SHDISC", 3000);
@@ -500,32 +500,46 @@ static int catmPostBody(const char* body, int bodyLen, int bodyCap) {
             break;
         }
     }
-    if (!connected) return -1;
-
+    if (!connected) return false;
     if (catmCmd("AT+SHSTATE?", 5000).indexOf("+SHSTATE: 1") == -1) {
         Serial.println("[CM] SHSTATE not 1");
         catmCmd("AT+SHDISC", 3000);
-        return -1;
+        return false;
     }
+    return true;
+}
 
+// 在【已打开的 SH 会话】上发一个 POST 请求（body 到 PATH_APRS）。返回 HTTP 状态码
+// （解析失败=0）。不建链、不断链——会话由 catmSHOpen/catmSHClose 管理，故连发多请求
+// 只一次 TLS 握手。Headers 必须 SHCHEAD 后 SHAHEAD 前，否则 +CME ERROR → 无
+// Content-Type → 服务器解析失败 → 400。
+static int catmSHReq(const char* body, int bodyLen) {
     catmCmd("AT+SHCHEAD", 3000);
     catmCmd("AT+SHAHEAD=\"Content-Type\",\"application/json\"", 3000);
-
     String ret = catmCmd("AT+SHBOD=" + String(bodyLen) + ",3000", 5000);
     if (ret.indexOf(">") >= 0) {
         Serial2.write((const uint8_t*)body, bodyLen);
-        Serial2.flush();
-        delay(400);
+        Serial2.flush();                 // 阻塞到 UART 字节发完（115200 下每 KB ~87ms）
+        delay(150);                      // 再留点余量让模组把 body 收进 SHBOD（保守 150ms）
     }
-    ret = catmCmd("AT+SHREQ=\"" PATH_APRS "\",3", 30000);
-
-    // Parse HTTP status code from +SHREQ: "POST",<code>,<len>
+    ret = catmCmd("AT+SHREQ=\"" PATH_APRS "\",3", 15000);   // 30s→15s：瞬时丢包少干等
     int ci = ret.indexOf("\"POST\",");
     int code = 0;
     if (ci >= 0) {
         String s = ret.substring(ci + 7);
         code = s.substring(0, s.indexOf(",")).toInt();
     }
-    catmCmd("AT+SHDISC", 3000);
+    return code;
+}
+
+// 关闭 SH 会话。
+static void catmSHClose() { catmCmd("AT+SHDISC", 3000); }
+
+// 单发包：开会话 → 发一个 body → 关会话。配置A 的单点上传走这里，行为与改造前一致；
+// 返回 HTTP 状态码或 -1（建链失败）。批量上传请直接用 catmSHOpen + 多次 catmSHReq。
+static int catmPostBody(const char* body, int bodyLen, int bodyCap) {
+    if (!catmSHOpen(bodyCap)) return -1;
+    int code = catmSHReq(body, bodyLen);
+    catmSHClose();
     return code;
 }

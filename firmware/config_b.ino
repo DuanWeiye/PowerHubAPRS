@@ -20,6 +20,12 @@ static inline uint8_t fixSats()      { return liveFix.sats; }
 static inline bool    fixHasCourse() { return liveFix.courseValid; }
 static inline float   fixCourseDeg() { return liveFix.courseDeg; }
 
+// ── 配置B flush 调度器状态（提前到此声明，供 LCD 渲染与调度器共用）─────────────
+static uint32_t flStillSince = 0;   // 进入静止的 millis（0 = 当前非静止）
+static uint32_t flNoFixSince = 0;   // 丢定位的 millis（0 = 当前有定位）
+static uint32_t flLastUpload = 0;   // 上次成功切 LTE 上传时刻 → LCD "TX" 显示
+static bool     flSchedHold  = false; // 台面实测时挂起自动 flush 调度（只用手动 flflush 计时）
+
 // 切回 LTE 后等模组重新附着到网络再判网。
 // 二合一是 GNSS/LTE 分时共用射频：GNSS 跟踪期(CGNSPWR=1)LTE 被挂起，CGNSPWR=0 把
 // 射频交还 LTE 后，模组要数秒才能重新搜网+附着。切完射频**立刻**查 CEREG/激活 PDP
@@ -123,55 +129,9 @@ static void updateGps() {
     gpsState = good ? GS_FIX_GOOD : GS_SEARCHING;
 }
 
-// ═══════════════════════════════════════════════════════════════════════════
-// 分时发包：当前在 GNSS 跟踪模式 → 切 LTE → 发包 → 切回 GNSS 继续跟踪。
-// ═══════════════════════════════════════════════════════════════════════════
-static bool sendGpsData(bool queueOnFail) {
-    TrackPoint cur;
-    buildTrackPoint(cur);                 // 用当前 liveFix
-    catmState = CM_SENDING; refreshCatmLed();
-
-    catmCmd("AT+CGNSPWR=0", 3000);        // 出 GNSS，射频交还 LTE
-    gnssTracking = false;
-    if (catmFailStreak >= CATM_FAIL_REATTACH) {   // 连续失败 → 强制 IPv4 重附着
-        Serial.printf("[CM] %u consecutive failures -> IPv4 re-attach\n", catmFailStreak);
-        catmForceIPv4();
-        catmFailStreak = 0;
-    }
-    // ★ bearer 全程保持 active（开机/首发已激活）：实测 CGNSPWR 开关 GNSS 完全不影响
-    //   PDP（IP 不变）。绝不再 CNACT=0,0/0,1 反复抽建 bearer——那会让 SH(HTTP)应用的
-    //   连接句柄随 bearer 被抽掉而残留，下次 SHCONN 撞 "operation not allowed"（SH 假锁，
-    //   官方流程也是 bearer 一次性激活后保持、不每请求 toggle）。
-    // 实测：CGNSPWR=0 后加长延时(4s)反而锁更多——时序不是触发点，CGNSPWR 射频切换本身
-    // 就会扰乱 SH(TLS)栈（这是 SIM7080G GNSS+TLS 分时的固有弱点）。故不加延时，直接判网；
-    // 撞锁时由 catmPostBody 内部先轻量复位、不行再 CFUN=1,1。
-
-    bool ok = false;
-    if (catmCheckNet()) {                  // 确认 bearer 仍有可用 IPv4（active 时零副作用）
-        char body[160];
-        int bodyLen = fmtPoint(body, sizeof(body), cur);
-        Serial.printf("[CM] body(%d): %s\n", bodyLen, body);
-        int code = catmPostBody(body, bodyLen, 1024);
-        Serial.printf("[CM] POST %s -> HTTP %d\n", PATH_APRS, code);
-        ok = (code == 200 || code == 201);
-        if (ok) { catmFailStreak = 0; trackFlush(); }   // 仍在 LTE，顺手补发积压
-    } else {
-        Serial.println("[CM] Net unavailable (no usable IPv4)");
-    }
-
-    catmCmd("AT+CGNSPWR=1", 3000);        // 切回 GNSS 继续跟踪（bearer 不动，全程 active）
-    gnssTracking  = true;
-    tLastGnssPoll = 0;                    // 立刻重新轮询定位
-
-    if (ok) {
-        catmState = CM_OK; refreshCatmLed(); delay(800); catmState = CM_READY;
-    } else {
-        catmFailStreak++; catmState = CM_ERR;
-        if (queueOnFail) trackEnqueue(cur);
-    }
-    refreshCatmLed();
-    return ok;
-}
+// 注：配置B 不再有"实时分时发包"——改为 beacon 记录到 Flash 段日志(configBeaconAction)
+// + 静止/无定位时整批切 LTE 上传(flashFlushViaLte)。故旧的 sendGpsData(CGNSPWR 切换单
+// 点发) 已删除；上层接口 sendGpsData 仅配置A 实现（共用 loop 经 configBeaconAction 调用）。
 
 // ═══════════════════════════════════════════════════════════════════════════
 // LCD 状态屏（Unit LCD 1.14"，竖屏 135x240，黑底浅色字）
@@ -219,7 +179,7 @@ static const char* gpsWord(int* col) {
         case GS_FIX_GOOD:  *col = GREEN;    return "FIX";
         case GS_SEARCHING: *col = YELLOW;   return "SEARCH";
         case GS_INIT_OK:   *col = CYAN;     return "INIT";
-        case GS_INIT_FAIL: *col = RED;      return "ERR";
+        case GS_INIT_FAIL: *col = RED;      return "ERROR";
         default:           *col = DARKGREY; return "OFF";
     }
 }
@@ -229,26 +189,34 @@ static const char* netWord(int* col) {
         case CM_READY:   *col = CYAN;     return "READY";
         case CM_SENDING: *col = WHITE;    return "SEND";
         case CM_OK:      *col = GREEN;    return "OK";
-        case CM_ERR:     *col = RED;      return "FAIL";
+        case CM_ERR:     *col = RED;      return "ERROR";
         case CM_INIT:    *col = YELLOW;   return "INIT";
         default:         *col = DARKGREY; return "OFF";
     }
 }
 
-// 把状态画进 g（离屏画布或直接是屏）。
+// 把状态画进 g（离屏画布或直接是屏）。135×240 竖屏，分隔线把屏分成几个"带"，
+// 每个带里内容带内居中。上 4 行大字(Font4)各占 45px；底部 UP/TX/BUF 一块(无内部分隔线)，
+// Font2、标签左 + 数值右、全白。LovyanGFX 无 Font3。
+// 注：Font4 字格含下沿留白，大写/数字只占上半，故大字垂直中心 +4px 才视觉居中。
 static void lcdRender(LovyanGFX* g) {
     char line[40];
     int  col;
     g->fillScreen(BLACK);
     g->setTextWrap(false);
 
-    // 正文统一 Font4(26px)；细节(卫星行)也用 Font4 居中，运行时长/TX 用 Font2(16px)。
-    // ── 时间（与其它行同字号 Font4，仅 HH:MM，居中）──
-    // RTC 存 UTC epoch；+9h 用 gmtime 出 JST 墙钟，不动全局 TZ
-    // （动 TZ 会让 catmSyncTime 里 mktime 的 JST→UTC 换算重复减 9h 出错）。
+    // 分隔线 y：时间|电量|定位|网络| 之后底部 UP/TX/BUF 一块（UP 下方不再有分隔线）。
+    const int D1 = 45, D2 = 90, D3 = 135, D4 = 180;
+    g->drawFastHLine(4, D1, 127, DARKGREY); g->drawFastHLine(4, D2, 127, DARKGREY);
+    g->drawFastHLine(4, D3, 127, DARKGREY); g->drawFastHLine(4, D4, 127, DARKGREY);
+    // 大字带视觉中心（带几何中心 +4 补字格下沿留白）；底部小字三行
+    const int CY_TIME = 26, CY_BAT = 71, CY_GPS = 116, CY_NET = 161;
+    const int CY_UP = 192, CY_TX = 212, CY_BUF = 231;
+
+    // ── 时间 HH:MM（Font4，带内居中）。RTC 存 UTC epoch；+9h 出 JST 墙钟，不动全局 TZ。──
     time_t rt = time(nullptr);
     g->setFont(&fonts::Font4);
-    g->setTextDatum(textdatum_t::top_center);
+    g->setTextDatum(textdatum_t::middle_center);
     if (rt > 1735689600L) {
         time_t jst = rt + 9 * 3600;
         struct tm t; gmtime_r(&jst, &t);
@@ -258,84 +226,75 @@ static void lcdRender(LovyanGFX* g) {
         snprintf(line, sizeof(line), "--:--");
         g->setTextColor(DARKGREY, BLACK);
     }
-    g->drawString(line, 67, 8);
-    g->drawFastHLine(4, 38, 127, DARKGREY);
+    g->drawString(line, 67, CY_TIME);
 
-    // ── 定位 ──
-    g->setFont(&fonts::Font4);
-    g->setTextDatum(textdatum_t::top_left);
-    g->setTextColor(LIGHTGREY, BLACK);
-    g->drawString("G", 4, 44);
-    const char* gw = gpsWord(&col);
-    g->setTextColor(col, BLACK);
-    g->setTextDatum(textdatum_t::top_right);
-    g->drawString(gw, 131, 44);
-    // 卫星数：Font4 居中
-    g->setTextDatum(textdatum_t::top_center);
-    g->setTextColor(WHITE, BLACK);
-    snprintf(line, sizeof(line), "%u sate", (unsigned)fixSats());
-    g->drawString(line, 67, 76);
-    g->drawFastHLine(4, 106, 127, DARKGREY);
-
-    // ── 网络 ──
-    g->setTextDatum(textdatum_t::top_left);
-    g->setTextColor(LIGHTGREY, BLACK);
-    g->drawString("N", 4, 112);
-    const char* nw = netWord(&col);
-    g->setTextColor(col, BLACK);
-    g->setTextDatum(textdatum_t::top_right);
-    g->drawString(nw, 131, 112);
-    g->drawFastHLine(4, 142, 127, DARKGREY);
-
-    // ── 电量（一行：左 % 按电量着色 + 右 电压一位小数）──
-    int bcol = !batValid ? CYAN
-             : batPct < 10 ? RED
-             : batPct < 30 ? ORANGE
-             : batPct < 60 ? YELLOW : GREEN;
-    g->setTextDatum(textdatum_t::top_left);
-    g->setTextColor(bcol, BLACK);
-    snprintf(line, sizeof(line), "%d%%", batPct);
-    g->drawString(line, 4, 148);
-    g->setTextDatum(textdatum_t::top_right);
-    g->setTextColor(WHITE, BLACK);
-    if (batMv > 1000) snprintf(line, sizeof(line), "%.1fV", batMv / 1000.0);
-    else              snprintf(line, sizeof(line), "--");
-    g->drawString(line, 131, 148);
-    g->drawFastHLine(4, 178, 127, DARKGREY);
-
-    // ── 运行时长（Font2 小字、居中；分精度，只用 h/m。时数>2位时去掉 "up" 省宽）──
+    // ── 电量 100% 8.3V（Font4，% 按电量着色 + V 白，整体带内居中）──
     {
-        uint32_t upMin = millis() / 60000UL, uh = upMin / 60, um = upMin % 60;
-        g->setFont(&fonts::Font2);
-        g->setTextDatum(textdatum_t::top_center);
-        g->setTextColor(LIGHTGREY, BLACK);
-        if (uh < 100) snprintf(line, sizeof(line), "up %luh %lum",
-                               (unsigned long)uh, (unsigned long)um);
-        else          snprintf(line, sizeof(line), "%luh %lum",
-                               (unsigned long)uh, (unsigned long)um);
-        g->drawString(line, 67, 184);
+        int bcol = !batValid ? CYAN
+                 : batPct < 10 ? RED
+                 : batPct < 30 ? ORANGE
+                 : batPct < 60 ? YELLOW : GREEN;
+        char pct[12], volt[12];
+        snprintf(pct, sizeof(pct), "%d%% ", batPct);
+        if (batMv > 1000) snprintf(volt, sizeof(volt), "%.1fV", batMv / 1000.0);
+        else              snprintf(volt, sizeof(volt), "--");
+        int wp = g->textWidth(pct), wv = g->textWidth(volt);
+        int x0 = (135 - (wp + wv)) / 2; if (x0 < 0) x0 = 0;
+        g->setTextDatum(textdatum_t::middle_left);
+        g->setTextColor(bcol, BLACK);  g->drawString(pct,  x0,      CY_BAT);
+        g->setTextColor(WHITE, BLACK); g->drawString(volt, x0 + wp, CY_BAT);
     }
 
-    // ── 上次上报 / 队列（底部一行小字）──
+    // ── 定位（Font4，带内居中）。定位中：FIX 左 + 卫星数 右；否则居中 SEARCH/INIT/ERROR/OFF ──
+    g->setFont(&fonts::Font4);
+    { const char* gw = gpsWord(&col);
+      g->setTextColor(col, BLACK);
+      if (gpsState == GS_FIX_GOOD) {
+          g->setTextDatum(textdatum_t::middle_left);
+          g->drawString("FIX", 4, CY_GPS);
+          g->setTextDatum(textdatum_t::middle_right);
+          snprintf(line, sizeof(line), "%u", (unsigned)fixSats());
+          g->drawString(line, 131, CY_GPS);
+      } else {
+          g->setTextDatum(textdatum_t::middle_center);
+          g->drawString(gw, 67, CY_GPS);
+      } }
+
+    // ── 网络（Font4，带内居中）：READY/SEND/OK/ERROR/INIT/OFF ──
+    { const char* nw = netWord(&col);
+      g->setTextDatum(textdatum_t::middle_center);
+      g->setTextColor(col, BLACK);
+      g->drawString(nw, 67, CY_NET); }
+
+    // ── 底部三行 UP/TX/BUF（Font2，标签左 / 数值右，全白；BUF 失败时转红）──
     g->setFont(&fonts::Font2);
-    g->setTextDatum(textdatum_t::top_left);
     g->setTextColor(WHITE, BLACK);
-    if (haveAnchor) {
-        uint32_t ago = (millis() - tLastSend) / 1000;
-        if (ago < 600) snprintf(line, sizeof(line), "TX %lus", (unsigned long)ago);
-        else           snprintf(line, sizeof(line), "TX %lum", (unsigned long)(ago / 60));
-    } else snprintf(line, sizeof(line), "TX --");
-    g->drawString(line, 4, 214);
-    g->setTextDatum(textdatum_t::top_right);
-    if (catmFailStreak) {
-        g->setTextColor(RED, BLACK);
-        snprintf(line, sizeof(line), "q%u f%u",
-                 (unsigned)trackCount, (unsigned)catmFailStreak);
-    } else {
-        g->setTextColor(trackCount ? ORANGE : DARKGREY, BLACK);
-        snprintf(line, sizeof(line), "q%u", (unsigned)trackCount);
+
+    // 运行时长 UP 99h 59m
+    {
+        uint32_t m = millis() / 60000UL;
+        g->setTextDatum(textdatum_t::middle_left);  g->drawString("UP", 4, CY_UP);
+        snprintf(line, sizeof(line), "%luh %lum",
+                 (unsigned long)(m / 60), (unsigned long)(m % 60));
+        g->setTextDatum(textdatum_t::middle_right); g->drawString(line, 131, CY_UP);
     }
-    g->drawString(line, 131, 214);
+
+    // TX 上次上传距今 1h 29m（仅时+分；从未上传显示 -----）
+    g->setTextDatum(textdatum_t::middle_left);  g->drawString("TX", 4, CY_TX);
+    if (flLastUpload) {
+        uint32_t m = (millis() - flLastUpload) / 60000UL;
+        snprintf(line, sizeof(line), "%luh %lum", (unsigned long)(m / 60), (unsigned long)(m % 60));
+    } else snprintf(line, sizeof(line), "-----");
+    g->setTextDatum(textdatum_t::middle_right); g->drawString(line, 131, CY_TX);
+
+    // BUF 积压：BF <pt> PT / <sg> SG（失败时整行转红）
+    {
+        uint16_t seg; uint32_t pts; flashLogCounts(&seg, &pts);
+        g->setTextColor(catmFailStreak ? RED : WHITE, BLACK);
+        g->setTextDatum(textdatum_t::middle_left);  g->drawString("BF", 4, CY_BUF);
+        snprintf(line, sizeof(line), "%lu PT / %u SG", (unsigned long)pts, (unsigned)seg);
+        g->setTextDatum(textdatum_t::middle_right); g->drawString(line, 131, CY_BUF);
+    }
 }
 
 // 重绘状态屏（仅亮屏时）。画布存在则整帧推送（无闪烁），否则直绘。
@@ -384,6 +343,7 @@ static void configSetupEarly() {
     lcdInit();
     displayOn = lcdOK;            // 开机即亮（含整个 init 过程）
     lcdBootMsg("starting...");
+    // flashLogBegin() 已挪到共用 setup()（配置A/B 都挂载 LittleFS）。
 }
 
 // setup：catmInit 之前 → 屏上提示"LTE init..."。
@@ -433,37 +393,73 @@ static void configLoopPrePwrlog() {
 // 配置B 跳过对时重试：GNSS 跟踪期跑 SHCONN 会和 GNSS 冲突；开机时已对过一次时。
 static void configLoopSync(uint32_t now) { (void)now; }
 
-// loop：配置B 红灯处理（不依赖定位）。
-// 红灯=发包失败；失败的 beacon 会把点入队(trackEnqueue)，所以红灯≈"有积压待发"。
-// 原则(用户 06-19"只做有必要的事")：只有"确有积压要发"时才临时切 LTE 探网；
-// 没有待发数据就别折腾网络，安心追 GPS，并把无意义的红灯清回蓝。
+// 到 beacon 点：把当前定位记进 LittleFS 段日志（不切射频、不发网，开销 ~1ms）。
+static void configBeaconAction() {
+    TrackPoint p; buildTrackPoint(p);
+    flashLogAppend(p);
+    uint16_t seg; uint32_t pts; flashLogCounts(&seg, &pts);
+    Serial.printf("[FL] 记录点 → 积压 %lu 点 / %u 封段\n", (unsigned long)pts, seg);
+}
+
+// 切 GNSS→LTE、上传所有封段（最旧先发、200即删）、再切回 GNSS。
+// forced=true 为长按强制（无视静止/无定位条件，连当前半段也封进来一起发）。
+static void flashFlushViaLte(bool forced) {
+    uint16_t seg; uint32_t pts; flashLogCounts(&seg, &pts);
+    if (pts == 0) { if (forced) Serial.println("[FL] 无积压可传"); return; }
+
+    catmState = CM_SENDING; refreshCatmLed();
+    Serial.printf("[FL] 切 LTE 上传 %lu 点%s…\n", (unsigned long)pts, forced ? "(强制)" : "");
+    catmCmd("AT+CGNSPWR=0", 3000);                 // 出 GNSS，射频回 LTE（bearer 全程保持）
+    gnssTracking = false;
+    catmWaitReg(8000);                             // 等射频从 GNSS 切回 LTE 重新附着（通常秒过）
+    if (catmFailStreak >= CATM_FAIL_REATTACH) { catmForceIPv4(); catmFailStreak = 0; }
+
+    int uploaded = 0;
+    if (catmCheckNet()) uploaded = flashLogUpload();   // 逐段发、200即删；catmPostBody 内含 SH 自愈
+    else Serial.println("[FL] 无可用 IPv4，留待下次");
+
+    catmCmd("AT+CGNSPWR=1", 3000);                 // 切回 GNSS 继续跟踪
+    gnssTracking = true; tLastGnssPoll = 0;
+
+    if (uploaded > 0) {
+        catmFailStreak = 0; flLastUpload = millis();
+        flStillSince = flNoFixSince = 0;           // 复位计时，避免同一静止/无定位窗口反复触发
+        catmState = CM_OK; refreshCatmLed(); delay(600); catmState = CM_READY;
+        uint32_t remain; flashLogCounts(nullptr, &remain);
+        Serial.printf("[FL] 上传完成 %d 点，剩余 %lu 点\n", uploaded, (unsigned long)remain);
+    } else {
+        catmFailStreak++; catmState = CM_ERR;
+        Serial.println("[FL] 上传未成功，保留积压（下次重试）");
+    }
+    refreshCatmLed();
+}
+
+// loop：配置B 的 flush 调度器（每轮跑，开销忽略）。
+// 维护"静止/无定位"计时，满足 flushDue()（攒满≥1段 且 静止≥5min 或 无定位≥5min）即
+// 切 LTE 上传积压。空积压时什么都不做——传完即空，空了不再判断，直到攒出新封段。
 static void configLoopRecover(uint32_t now) {
-    if (catmReady && gnssTracking && catmState == CM_ERR && gpsState != GS_FIX_GOOD) {
-        if (trackCount == 0) {
-            // 无积压 → 红灯没有意义（没东西要发）→ 清为蓝，继续追踪，不切网
-            catmState = CM_READY;
-            refreshCatmLed();
-        } else if (now - tLastCatmRecover >= CATM_FAIL_RETRY_MS) {
-            tLastCatmRecover = now;
-            Serial.printf("[CM] B 红灯恢复：%u 条积压待发，切 LTE 探网…\n", trackCount);
-            catmCmd("AT+CGNSPWR=0", 3000);            // 出 GNSS，射频回 LTE（bearer 全程保持）
-            gnssTracking = false;
-            // bearer 不动（CGNSPWR 不影响 PDP）；只等射频从 GNSS 切回 LTE 重新就绪。
-            catmWaitReg(8000);                        // 一直在网，通常秒过
-            if (catmFailStreak >= CATM_FAIL_REATTACH) { catmForceIPv4(); catmFailStreak = 0; }
-            uint16_t before = trackCount;
-            if (catmCheckNet()) trackFlush();         // bearer 仍 active；catmPostBody 内含 SH 自愈
-            if (trackCount < before) {                // 只有积压真发出去（队列变短）才清红，绝不假恢复
-                Serial.println("[CM] B 恢复：积压补发成功 → 清红");
-                catmState = CM_READY; catmFailStreak = 0;
-            } else {
-                catmFailStreak++;                      // 仍发不出，保持红
-            }
-            catmCmd("AT+CGNSPWR=1", 3000);            // 切回 GNSS 继续跟踪（bearer 不动）
-            gnssTracking  = true;
-            tLastGnssPoll = 0;
-            refreshCatmLed();
-        }
+    if (!catmReady) return;
+    bool hasFix = (gpsState == GS_FIX_GOOD);
+    if (hasFix) {
+        flNoFixSince = 0;
+        float spd = fixHasSpeed() ? fixSpdKmh() : 0.0f;
+        if (spd < FL_STILL_KMH) { if (!flStillSince) flStillSince = now; }
+        else flStillSince = 0;
+    } else {
+        flStillSince = 0;
+        if (!flNoFixSince) flNoFixSince = now;
+    }
+
+    uint16_t seg; uint32_t pts; flashLogCounts(&seg, &pts);
+    FlushInputs in;
+    in.sealedSegs = seg;
+    in.stillMs    = flStillSince ? (now - flStillSince) : 0;
+    in.noFixMs    = flNoFixSince ? (now - flNoFixSince) : 0;
+    in.forced     = false;
+    if (flushDue(in) && !flSchedHold) {
+        Serial.printf("[FL] 触发上传：%u 封段，静止 %lus / 无定位 %lus\n",
+                      seg, (unsigned long)(in.stillMs / 1000), (unsigned long)(in.noFixMs / 1000));
+        flashFlushViaLte(false);
     }
 }
 
@@ -472,6 +468,12 @@ static void configLoopRecover(uint32_t now) {
 static void configOnTopShortPress() {
     Serial.printf("[BTN] top short press → display %s\n", displayOn ? "OFF" : "ON");
     displaySetOn(!displayOn);
+}
+
+// 顶部按钮长按：立即强制 flush 积压（不等静止/无定位，让用户主动选时机上传）。
+static void configForceUpload() {
+    Serial.println("[FL] 长按 → 强制上传积压");
+    flashFlushViaLte(true);
 }
 
 #endif  // GNSS_TIMESHARE

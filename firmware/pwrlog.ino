@@ -148,7 +148,36 @@ static void checkSerialCommands() {
             else if (!strcmp(buf, "sendtest"))  { forceSendReq = true; Serial.println("[CMD] 强制发包"); }
             else if (!strcmp(buf, "gnsstest")) gnssSwitchTest();
             else if (!strcmp(buf, "atscan"))   atScan();
+#if GNSS_TIMESHARE
+            // ── 配置B 段日志台面实测命令（室内无 GPS，灌假点量上传耗时）──
+            else if (!strncmp(buf, "flfill", 6)) {
+                int n = atoi(buf + 6); if (n <= 0) n = 1;
+                flashLogFillTest(n);
+                uint16_t seg; uint32_t pts; flashLogCounts(&seg, &pts);
+                Serial.printf("[FL] 灌入 %d 假点 → 积压 %lu 点 / %u 封段\n",
+                              n, (unsigned long)pts, seg);
+            }
+            else if (!strcmp(buf, "flflush")) {
+                uint16_t seg; uint32_t pts; flashLogCounts(&seg, &pts);
+                Serial.printf("[FL] flflush 开始：积压 %lu 点 / %u 封段\n", (unsigned long)pts, seg);
+                uint32_t t0 = millis();
+                flashFlushViaLte(true);
+                Serial.printf("[FL] flflush 完成：本次上传整体耗时 %lu ms\n",
+                              (unsigned long)(millis() - t0));
+            }
+            else if (!strcmp(buf, "flstat")) {
+                uint16_t seg; uint32_t pts; flashLogCounts(&seg, &pts);
+                Serial.printf("[FL] 积压 %lu 点 / %u 封段（调度 %s）\n",
+                              (unsigned long)pts, seg, flSchedHold ? "已挂起" : "自动");
+            }
+            else if (!strcmp(buf, "flclear")) { flashLogClear(); Serial.println("[FL] 段日志已清空"); }
+            else if (!strcmp(buf, "flhold"))  { flSchedHold = !flSchedHold;
+                Serial.printf("[FL] 自动 flush 调度 → %s\n", flSchedHold ? "挂起(只手动)" : "恢复自动"); }
+            else if (!strcmp(buf, "help")) Serial.println(
+                "[CMD] log|logclear|sendtest|at<cmd>|gnsstest|atscan | flfill<n>|flflush|flstat|flclear|flhold | help");
+#else
             else if (!strcmp(buf, "help"))     Serial.println("[CMD] log | logclear | sendtest | at<cmd> | gnsstest | atscan | help");
+#endif
             else Serial.printf("[CMD] unknown: '%s' (try: help)\n", buf);
         } else if (len < sizeof(buf) - 1) {
             buf[len++] = c;

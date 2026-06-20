@@ -28,57 +28,9 @@ static void buildTrackPoint(TrackPoint& p) {
     p.bat_pct = (uint8_t)batPct;
 }
 
-// Append a point to the queue. Ring buffer: overwrites the oldest when full, so
-// it can never overflow — a long outage just keeps the most recent CAP points.
-static void trackEnqueue(const TrackPoint& p) {
-    trackQueue[trackHead] = p;
-    trackHead = (trackHead + 1) % TRACK_QUEUE_CAP;
-    if (trackCount < TRACK_QUEUE_CAP) trackCount++;
-    Serial.printf("[Q] queued point (depth=%u/%u)\n", trackCount, TRACK_QUEUE_CAP);
-}
-
-// Re-send backlogged points, oldest first, in batches (JSON array body). Stops at
-// the first failed batch (network still down) — those stay queued. Capped per
-// call so one flush can't block the loop too long.
-static void trackFlush() {
-    if (trackCount == 0) return;
-    static char body[1024];
-    uint8_t batches = 0;
-    while (trackCount > 0 && batches < TRACK_FLUSH_BATCHES) {
-        uint16_t want = trackCount < TRACK_BATCH ? trackCount : TRACK_BATCH;
-        uint16_t tail = (trackHead - trackCount + TRACK_QUEUE_CAP) % TRACK_QUEUE_CAP;
-        int      pos  = 0;
-        uint16_t take = 0;               // 实际放进本批的点数（可能 < want）
-        body[pos++] = '[';
-        for (uint16_t i = 0; i < want; i++) {
-            const TrackPoint& p = trackQueue[(tail + i) % TRACK_QUEUE_CAP];
-            char one[160];
-            int  n = fmtPoint(one, sizeof(one), p);   // 单点必然 < 160，n 为真实长度
-            // 需要的空间 = 可能的逗号 + 本点 + 结尾 ']' + '\0'。放不下就留到下一批，
-            // 绝不截断坐标（保持 %.7f 精度），也绝不越界写 body。
-            // （旧写法 pos += fmtPoint(...) 用 snprintf 的"应写长度"，截断时会把 pos
-            //   推过缓冲尾，随后写 ']'/'\0' 越界——这里改为先量后拷，从根上杜绝。）
-            int need = (take ? 1 : 0) + n + 2;
-            if (pos + need > (int)sizeof(body)) break;
-            if (take) body[pos++] = ',';
-            memcpy(body + pos, one, n); pos += n;
-            take++;
-        }
-        body[pos++] = ']';
-        body[pos]   = 0;
-        if (take == 0) return;           // 连一个点都塞不下（不应发生）→ 不发空数组
-
-        if (!catmCheckNet()) { Serial.println("[Q] flush: net gone — keep queued"); return; }
-        int code = catmPostBody(body, pos, 1024);
-        Serial.printf("[Q] flush %u pts -> HTTP %d (depth was %u)\n", take, code, trackCount);
-        if (code == 200 || code == 201) {
-            trackCount -= take;          // dequeue the oldest `take`
-            batches++;
-        } else {
-            return;                      // still failing → leave queued for next time
-        }
-    }
-}
+// 存转（断网积压）已统一到 flashlog.ino 的 LittleFS 段日志（断电不丢）：
+//   · 失败入队 = flashLogAppend(p)；批量补发 = flashLogUpload()。
+//   · 旧的 RAM 环形队列(trackEnqueue/trackFlush)已删除。
 
 // ═══════════════════════════════════════════════════════════════════════════
 // Adaptive beaconing decision (SmartBeaconing + decay + corner pegging)
