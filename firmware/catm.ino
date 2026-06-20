@@ -44,7 +44,10 @@ static String catmCmd(const String& cmd, unsigned long timeout) {
             }
             if (ret.indexOf("|ERROR|") >= 0) break;
         } else if (cmd.startsWith("AT+SHREQ=")) {
-            if (ret.indexOf("+SHREQ") >= 0 && ret.endsWith("|")) break;
+            // 必须匹配带冒号的结果 URC "+SHREQ:"（如 +SHREQ: "POST",200,22）；不能用
+            // 裸 "+SHREQ"——命令回显 "AT+SHREQ=..." 含该子串，回显未关时会被误命中而
+            // 28ms 就早退，漏读 ~100ms 后才到的真状态码（把 HTTP 200 错读成 0）。
+            if (ret.indexOf("+SHREQ:") >= 0 && ret.endsWith("|")) break;
         } else if (cmd.startsWith("AT+SHREAD=")) {
             if (ret.indexOf("+SHREAD:") >= 0) {
                 int ci = cmd.lastIndexOf(',');
@@ -439,8 +442,16 @@ static bool catmSyncTime() {
 static bool catmSHRecover() {
     Serial.println("[CM] === SH 锁死恢复：AT+CFUN=1,1 整模块软重启 ===");
     catmCmd("AT+CFUN=1,1", 20000);    // 等模块重启到 RDY
-    delay(1000);
-    catmCmd("ATE0", 2000);            // 重启后回显默认 ON，必须关掉，否则应答解析错位
+    // CFUN=1,1 返回 RDY 后 UART 仍要十几秒才真正应答 AT（实测 ATE0/CMEE/CSCLK 全是
+    // 空响应超时）。此时回显默认仍 ON、ATE0 丢进空气 → 后续命令回显残留，触发上面
+    // catmCmd 的早退误判、漏读 HTTP 状态码。故先轮询 AT 真就绪，再做配置。
+    bool atReady = false;
+    for (int i = 0; i < 30; i++) {    // 最多 ~15s 等 UART 恢复
+        if (catmCmd("AT", 1000).indexOf("|OK|") >= 0) { atReady = true; break; }
+        delay(500);
+    }
+    Serial.printf("[CM] SH 恢复：模块 AT %s\n", atReady ? "就绪" : "仍无应答(仍继续配置)");
+    catmCmd("ATE0", 2000);            // 此刻已就绪，关回显才能真正生效
     catmCmd("AT+CMEE=2", 2000);
     catmCmd("AT+CSCLK=0", 2000);
     bool reg = false;                 // 等重新注册（CEREG 1 home / 5 roaming）
