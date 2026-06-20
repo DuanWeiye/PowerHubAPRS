@@ -83,6 +83,10 @@ static const uint8_t VA_IR[6]  = {0x32,0x36,0x3A,0x3E,0x42,0x46};
 // ONLY when external power is absent (USB already gone) — see notes, not done here.
 static const uint8_t  CPU_MHZ           = 80;
 static const uint32_t GPS_DETECT_MS     = 10000;  // max wait before declaring "no module"
+// 配置B LCD：GNSS 已开但连续 0 可见星超此时长 → GNSS 行转红显示 "ANT?"（疑天线/接线）。
+// 模块不给真天线检测命令、ANTENNA NMEA 又不到主串口，只能靠"持续 0 星"反推；阈值取
+// 远大于正常冷启 TTFF（好天线阳台 ~1min 必有星），避免冷启途中误报。
+static const uint32_t GNSS_NOSAT_WARN_MS = 180000UL;  // 3 min
 static const uint32_t GPS_RAW_DUMP_MS   = 0;//600000; // print raw NMEA for first 60 s (diagnostic)
 static const uint32_t GPS_INIT_SHOW_MS  = 1500;   // duration of init-OK blue flash
 static const uint32_t BAT_READ_MS       = 15000;  // battery read period
@@ -107,6 +111,9 @@ static const uint16_t PWRLOG_CAP        = 450;      // ring → ~15 h window at 
 // the PDP to IPv4 and, on repeated failure, force a re-attach to renegotiate it.
 static const uint8_t  CATM_FAIL_REATTACH = 3;       // consecutive send fails → CFUN re-attach
 static const uint32_t CATM_FAIL_RETRY_MS = 60000UL; // after a failed send, retry this soon
+// 配置B flush 切 LTE 后"等网络就绪"的上限：超时即放弃、保留积压、下轮重试。替代
+// catmCheckNet 的 3 轮长重试（最坏 ~2-3min 干等再红灯）——存转不丢数据，没必要长冻结。
+static const uint32_t FL_REG_WAIT_MS     = 20000UL; // flush 等注册上限（总耗时上限 ~35-40s）
 
 // ── Store-and-forward ─────────────────────────────────────────────────────────
 // 配置A/B 统一用 flashlog.ino 的 LittleFS 段日志做存转（断电不丢）。批量大小/段大小
@@ -200,7 +207,7 @@ struct __attribute__((packed)) PwrLogEntry {
 
 #if GNSS_TIMESHARE
 // ── 配置B LCD 显示参数（Unit LCD 1.14"）──────────────────────────────────────
-static const uint32_t DISPLAY_ON_MS  = 30000;   // 短按/开机亮屏时长（30s）
+static const uint32_t DISPLAY_ON_MS  = 60000;   // 短按/开机亮屏时长（1 分钟）
 static const uint32_t LCD_DRAW_MS    = 500;     // 亮屏时状态重绘周期（<1s：秒钟不漏跳）
 static const uint8_t  LCD_BRIGHTNESS = 110;     // 亮屏亮度（0-255）
 #endif

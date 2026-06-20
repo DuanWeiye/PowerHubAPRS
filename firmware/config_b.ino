@@ -25,6 +25,7 @@ static uint32_t flStillSince = 0;   // 进入静止的 millis（0 = 当前非静
 static uint32_t flNoFixSince = 0;   // 丢定位的 millis（0 = 当前有定位）
 static uint32_t flLastUpload = 0;   // 上次成功切 LTE 上传时刻 → LCD "TX" 显示
 static bool     flSchedHold  = false; // 台面实测时挂起自动 flush 调度（只用手动 flflush 计时）
+static uint32_t tSatsZeroSince = 0;   // 进入"连续 0 可见星"的 millis（0=非零星/未开始）；LCD 据此判 ANT? 告警
 
 // 切回 LTE 后等模组重新附着到网络再判网。
 // 二合一是 GNSS/LTE 分时共用射频：GNSS 跟踪期(CGNSPWR=1)LTE 被挂起，CGNSPWR=0 把
@@ -66,7 +67,11 @@ static void pollGnssIntoLiveFix() {
         liveFix.sats        = (uint8_t)fld(14).toInt();
     } else {
         liveFix.valid = false;
+        liveFix.sats  = (uint8_t)fld(14).toInt();   // 搜星中也记录可见星数（LCD 现场判断 + 天线代理）
     }
+    // 维护"连续 0 可见星"计时：有星即清零；首次 0 星记起点 → LCD 据此判 ANT? 天线告警。
+    if (liveFix.sats > 0) tSatsZeroSince = 0;
+    else if (tSatsZeroSince == 0) tSatsZeroSince = millis();
     liveFix.tMs = millis();
 }
 
@@ -228,21 +233,20 @@ static void lcdRender(LovyanGFX* g) {
     }
     g->drawString(line, 67, CY_TIME);
 
-    // ── 电量 100% 8.3V（Font4，% 按电量着色 + V 白，整体带内居中）──
+    // ── 电量：100% 左对齐(按电量着色) + 电压右对齐(白)（Font4），与其余各行对齐 ──
     {
         int bcol = !batValid ? CYAN
                  : batPct < 10 ? RED
                  : batPct < 30 ? ORANGE
                  : batPct < 60 ? YELLOW : GREEN;
         char pct[12], volt[12];
-        snprintf(pct, sizeof(pct), "%d%% ", batPct);
+        snprintf(pct, sizeof(pct), "%d%%", batPct);
         if (batMv > 1000) snprintf(volt, sizeof(volt), "%.1fV", batMv / 1000.0);
         else              snprintf(volt, sizeof(volt), "--");
-        int wp = g->textWidth(pct), wv = g->textWidth(volt);
-        int x0 = (135 - (wp + wv)) / 2; if (x0 < 0) x0 = 0;
-        g->setTextDatum(textdatum_t::middle_left);
-        g->setTextColor(bcol, BLACK);  g->drawString(pct,  x0,      CY_BAT);
-        g->setTextColor(WHITE, BLACK); g->drawString(volt, x0 + wp, CY_BAT);
+        g->setTextColor(bcol, BLACK);
+        g->setTextDatum(textdatum_t::middle_left);  g->drawString(pct,  4,   CY_BAT);
+        g->setTextColor(WHITE, BLACK);
+        g->setTextDatum(textdatum_t::middle_right); g->drawString(volt, 131, CY_BAT);
     }
 
     // ── 定位（Font4，带内居中）。定位中：FIX 左 + 卫星数 右；否则居中 SEARCH/INIT/ERROR/OFF ──
@@ -255,6 +259,22 @@ static void lcdRender(LovyanGFX* g) {
           g->setTextDatum(textdatum_t::middle_right);
           snprintf(line, sizeof(line), "%u", (unsigned)fixSats());
           g->drawString(line, 131, CY_GPS);
+      } else if (gpsState == GS_SEARCHING) {
+          // 搜星中显示可见星数；持续 0 星过久 → 极可能天线/接线问题。
+          // （模块不给真天线检测命令，ANTENNA NMEA 又不到主串口，只能靠"持续 0 星"反推）
+          if (fixSats() == 0 && tSatsZeroSince != 0
+                  && millis() - tSatsZeroSince >= GNSS_NOSAT_WARN_MS) {
+              g->setTextColor(RED, BLACK);
+              g->setTextDatum(textdatum_t::middle_center);
+              g->drawString("ANT?", 67, CY_GPS);
+          } else {
+              g->setTextColor(YELLOW, BLACK);
+              g->setTextDatum(textdatum_t::middle_left);
+              g->drawString("SRCH", 4, CY_GPS);
+              g->setTextDatum(textdatum_t::middle_right);
+              snprintf(line, sizeof(line), "%u", (unsigned)fixSats());
+              g->drawString(line, 131, CY_GPS);
+          }
       } else {
           g->setTextDatum(textdatum_t::middle_center);
           g->drawString(gw, 67, CY_GPS);
@@ -319,7 +339,7 @@ static void lcdBootMsg(const char* msg) {
     if (lcdCanvasOK) lcdCanvas.pushSprite(0, 0);
 }
 
-// 开/关屏。开 → 唤醒 + 设 30s 亮屏窗口 + 立即重绘；关 → 睡眠省电。
+// 开/关屏。开 → 唤醒 + 设 1 分钟亮屏窗口 + 立即重绘；关 → 睡眠省电。
 static void displaySetOn(bool on) {
     if (!lcdOK) { displayOn = on; return; }
     if (on) {
@@ -351,7 +371,7 @@ static void configSetupPreNet() {
     lcdBootMsg("LTE init...");
 }
 
-// setup：对时之后 → 进 GNSS 跟踪模式（让出网络给 GNSS），并先亮 30s 屏。
+// setup：对时之后 → 进 GNSS 跟踪模式（让出网络给 GNSS），并先亮 1 分钟屏。
 // 之后 loop 轮询 CGNSINF，到 beacon 时 sendGpsData() 临时切回 LTE 发包再切回。
 static void configSetupPostNet() {
     if (catmReady) {
@@ -361,11 +381,12 @@ static void configSetupPostNet() {
         Serial.println("[CM] enter GNSS tracking mode (CGNSPWR=1, bearer 保持 active)");
         catmCmd("AT+CGNSPWR=1", 3000);
         gnssTracking  = true;
+        tSatsZeroSince = 0;            // GNSS 刚开，0 星计时从首次轮询起算（给冷启 ~3min 再报 ANT?）
         gpsState      = GS_SEARCHING;
         catmState     = CM_READY;
         refreshCatmLed();
     }
-    // 开机先亮 30s（相当于按了一下），随后自动息屏。
+    // 开机先亮 1 分钟（相当于按了一下），随后自动息屏。
     displaySetOn(true);
 }
 
@@ -401,6 +422,20 @@ static void configBeaconAction() {
     Serial.printf("[FL] 记录点 → 积压 %lu 点 / %u 封段\n", (unsigned long)pts, seg);
 }
 
+// flush 专用：在有限预算内把网络弄到"可发 HTTPS"（已注册 + 有 IPv4 PDP）。
+// 已 active+IPv4 → 秒过；否则在 FL_REG_WAIT_MS 内等注册 + 激活一次 PDP，仍不行就放弃返回 false。
+// 关键：绝不像 catmCheckNet 那样 3 轮干等 ~2-3min（切回 LTE 网络偶尔没及时回来时会冻结+红灯）——
+// 存转不丢数据，宁可 ~35-40s 放弃、保留积压、下个时机重试（下次大概率已附着就传成）。
+static bool catmFlushNetReady() {
+    String r = catmCmd("AT+CNACT?", 5000);
+    if (r.indexOf("+CNACT: 0,1,") >= 0 && catmHasIPv4(r)) return true;   // 已就绪
+    if (!catmWaitReg(FL_REG_WAIT_MS)) return false;                       // 注册没及时回来 → 放弃
+    catmCmd("AT+CNCFG=0,1,\"" CATM_APN "\"", 3000);                       // 激活一次 PDP
+    catmCmd("AT+CNACT=0,1", 12000);
+    delay(1500);
+    return catmHasIPv4(catmCmd("AT+CNACT?", 3000));
+}
+
 // 切 GNSS→LTE、上传所有封段（最旧先发、200即删）、再切回 GNSS。
 // forced=true 为长按强制（无视静止/无定位条件，连当前半段也封进来一起发）。
 static void flashFlushViaLte(bool forced) {
@@ -411,15 +446,14 @@ static void flashFlushViaLte(bool forced) {
     Serial.printf("[FL] 切 LTE 上传 %lu 点%s…\n", (unsigned long)pts, forced ? "(强制)" : "");
     catmCmd("AT+CGNSPWR=0", 3000);                 // 出 GNSS，射频回 LTE（bearer 全程保持）
     gnssTracking = false;
-    catmWaitReg(8000);                             // 等射频从 GNSS 切回 LTE 重新附着（通常秒过）
     if (catmFailStreak >= CATM_FAIL_REATTACH) { catmForceIPv4(); catmFailStreak = 0; }
 
     int uploaded = 0;
-    if (catmCheckNet()) uploaded = flashLogUpload();   // 逐段发、200即删；catmPostBody 内含 SH 自愈
-    else Serial.println("[FL] 无可用 IPv4，留待下次");
+    if (catmFlushNetReady()) uploaded = flashLogUpload();  // 逐段发、200即删；catmSHOpen 内含 SH 自愈
+    else Serial.println("[FL] 网络未及时就绪（~35s内），留积压下轮重试，不长等");
 
     catmCmd("AT+CGNSPWR=1", 3000);                 // 切回 GNSS 继续跟踪
-    gnssTracking = true; tLastGnssPoll = 0;
+    gnssTracking = true; tLastGnssPoll = 0; tSatsZeroSince = 0;   // GNSS 重启→0星计时重置，免误报 ANT?
 
     if (uploaded > 0) {
         catmFailStreak = 0; flLastUpload = millis();
@@ -429,7 +463,9 @@ static void flashFlushViaLte(bool forced) {
         Serial.printf("[FL] 上传完成 %d 点，剩余 %lu 点\n", uploaded, (unsigned long)remain);
     } else {
         catmFailStreak++; catmState = CM_ERR;
-        Serial.println("[FL] 上传未成功，保留积压（下次重试）");
+        flStillSince = flNoFixSince = 0;   // ★失败也清计时：统一回退 ~5min 再试，杜绝"无定位+持续失败"
+                                            //   时 flushDue 恒真→每 30-75s 贴着重试的死循环(切射频/撞锁/掉电)。
+        Serial.println("[FL] 上传未成功，保留积压（计时复位，约 5min 后再试）");
     }
     refreshCatmLed();
 }
@@ -463,7 +499,7 @@ static void configLoopRecover(uint32_t now) {
     }
 }
 
-// 顶部按钮短按：亮屏/熄屏开关。亮屏 30s 后自动熄；亮着时再按立刻熄。
+// 顶部按钮短按：亮屏/熄屏开关。亮屏 1 分钟后自动熄；亮着时再按立刻熄。
 // （手动上传改由长按"强制上传"承担；移动中本就自动 beacon。）
 static void configOnTopShortPress() {
     Serial.printf("[BTN] top short press → display %s\n", displayOn ? "OFF" : "ON");
@@ -473,6 +509,7 @@ static void configOnTopShortPress() {
 // 顶部按钮长按：立即强制 flush 积压（不等静止/无定位，让用户主动选时机上传）。
 static void configForceUpload() {
     Serial.println("[FL] 长按 → 强制上传积压");
+    displaySetOn(true);            // 长按到点立即亮屏给反馈：看得到 Net=SEND、完后 BUF 归零（解决"以为没触发"）
     flashFlushViaLte(true);
 }
 
