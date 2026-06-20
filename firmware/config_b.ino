@@ -131,20 +131,23 @@ static bool sendGpsData(bool queueOnFail) {
     buildTrackPoint(cur);                 // 用当前 liveFix
     catmState = CM_SENDING; refreshCatmLed();
 
-    catmCmd("AT+CGNSPWR=0", 3000);        // 出 GNSS（让出射频给 LTE）
+    catmCmd("AT+CGNSPWR=0", 3000);        // 出 GNSS，射频交还 LTE
     gnssTracking = false;
     if (catmFailStreak >= CATM_FAIL_REATTACH) {   // 连续失败 → 强制 IPv4 重附着
         Serial.printf("[CM] %u consecutive failures -> IPv4 re-attach\n", catmFailStreak);
         catmForceIPv4();
         catmFailStreak = 0;
     }
-    // ★ 切回 LTE 后等重新附着再激活 PDP——分时共用射频，CGNSPWR=0 那刻 LTE 还在搜网，
-    //   原注释"~0.2s 可发、CEREG 不掉"是错的：立刻 CNACT/判网会误判失败 → 红灯。
-    catmWaitReg(20000);
-    catmCmd("AT+CNACT=0,1", 12000);       // 恢复 PDP（已附着后再激活）
+    // ★ bearer 全程保持 active（开机/首发已激活）：实测 CGNSPWR 开关 GNSS 完全不影响
+    //   PDP（IP 不变）。绝不再 CNACT=0,0/0,1 反复抽建 bearer——那会让 SH(HTTP)应用的
+    //   连接句柄随 bearer 被抽掉而残留，下次 SHCONN 撞 "operation not allowed"（SH 假锁，
+    //   官方流程也是 bearer 一次性激活后保持、不每请求 toggle）。
+    // 实测：CGNSPWR=0 后加长延时(4s)反而锁更多——时序不是触发点，CGNSPWR 射频切换本身
+    // 就会扰乱 SH(TLS)栈（这是 SIM7080G GNSS+TLS 分时的固有弱点）。故不加延时，直接判网；
+    // 撞锁时由 catmPostBody 内部先轻量复位、不行再 CFUN=1,1。
 
     bool ok = false;
-    if (catmCheckNet()) {
+    if (catmCheckNet()) {                  // 确认 bearer 仍有可用 IPv4（active 时零副作用）
         char body[160];
         int bodyLen = fmtPoint(body, sizeof(body), cur);
         Serial.printf("[CM] body(%d): %s\n", bodyLen, body);
@@ -156,8 +159,7 @@ static bool sendGpsData(bool queueOnFail) {
         Serial.println("[CM] Net unavailable (no usable IPv4)");
     }
 
-    catmCmd("AT+CNACT=0,0", 5000);        // 让位
-    catmCmd("AT+CGNSPWR=1", 3000);        // 切回 GNSS 继续跟踪
+    catmCmd("AT+CGNSPWR=1", 3000);        // 切回 GNSS 继续跟踪（bearer 不动，全程 active）
     gnssTracking  = true;
     tLastGnssPoll = 0;                    // 立刻重新轮询定位
 
@@ -394,8 +396,9 @@ static void configSetupPreNet() {
 static void configSetupPostNet() {
     if (catmReady) {
         lcdBootMsg("GNSS init...");
-        Serial.println("[CM] enter GNSS tracking mode (CNACT=0,0 -> CGNSPWR=1)");
-        catmCmd("AT+CNACT=0,0", 5000);
+        // bearer 保持 active（对时时已激活）；进 GNSS 跟踪只开 CGNSPWR，绝不 CNACT=0,0
+        // （抽掉 bearer 会让 SH 句柄残留→下次 SHCONN 假锁；实测 CGNSPWR 不影响 bearer）。
+        Serial.println("[CM] enter GNSS tracking mode (CGNSPWR=1, bearer 保持 active)");
         catmCmd("AT+CGNSPWR=1", 3000);
         gnssTracking  = true;
         gpsState      = GS_SEARCHING;
@@ -443,26 +446,20 @@ static void configLoopRecover(uint32_t now) {
         } else if (now - tLastCatmRecover >= CATM_FAIL_RETRY_MS) {
             tLastCatmRecover = now;
             Serial.printf("[CM] B 红灯恢复：%u 条积压待发，切 LTE 探网…\n", trackCount);
-            catmCmd("AT+CGNSPWR=0", 3000);            // 出 GNSS，让出射频
+            catmCmd("AT+CGNSPWR=0", 3000);            // 出 GNSS，射频回 LTE（bearer 全程保持）
             gnssTracking = false;
-            // ★ 切完射频不能立刻判网：等模组重新附着（这正是原来一次性 CEREG 误判→
-            //   永远红灯的根因）。已注册则秒过；最多等 ~20s 给它重新搜网。
-            bool registered = catmWaitReg(20000);
-            bool back = false;
-            if (registered) {
-                if (catmFailStreak >= CATM_FAIL_REATTACH) { catmForceIPv4(); catmFailStreak = 0; }
-                catmCmd("AT+CNACT=0,1", 12000);
-                back = catmHasIPv4(catmCmd("AT+CNACT?", 3000));
-            }
-            if (back) {
-                Serial.println("[CM] B 恢复：网络回来 → 补发积压 + 清红");
+            // bearer 不动（CGNSPWR 不影响 PDP）；只等射频从 GNSS 切回 LTE 重新就绪。
+            catmWaitReg(8000);                        // 一直在网，通常秒过
+            if (catmFailStreak >= CATM_FAIL_REATTACH) { catmForceIPv4(); catmFailStreak = 0; }
+            uint16_t before = trackCount;
+            if (catmCheckNet()) trackFlush();         // bearer 仍 active；catmPostBody 内含 SH 自愈
+            if (trackCount < before) {                // 只有积压真发出去（队列变短）才清红，绝不假恢复
+                Serial.println("[CM] B 恢复：积压补发成功 → 清红");
                 catmState = CM_READY; catmFailStreak = 0;
-                trackFlush();                          // 仍在 LTE，顺手补发
             } else {
-                catmFailStreak++;                      // 仍无网，保持红
+                catmFailStreak++;                      // 仍发不出，保持红
             }
-            catmCmd("AT+CNACT=0,0", 5000);            // 让位
-            catmCmd("AT+CGNSPWR=1", 3000);            // 切回 GNSS 继续跟踪
+            catmCmd("AT+CGNSPWR=1", 3000);            // 切回 GNSS 继续跟踪（bearer 不动）
             gnssTracking  = true;
             tLastGnssPoll = 0;
             refreshCatmLed();
