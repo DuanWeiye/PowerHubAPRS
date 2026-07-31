@@ -143,6 +143,62 @@ static const uint32_t MIN_TX_GAP_MS     = 30000UL;  // hard floor between ANY tw
                                                     // (a send takes ~20 s; also caps the
                                                     // "moved" trigger at cycling/原付 speed)
 
+// ── GNSS 野点(离群)过滤 + 配置B 定位质量门 ────────────────────────────────────
+// 二合一 GNSS(GPS+GLO 单频)偶尔吐出多径/坏星历的"野值"：一两个采样把定位甩到几公里
+// 外(东京湾/太平洋)，下一次又跳回来。用"相邻两次已接受定位的隐含速度"判定：超过任何
+// 交通方式都不可能达到的上限即判野点丢弃。不写死任何坐标(不对某片海域特判)，通用成立。
+static const float    GLITCH_MAX_MPS    = 100.0f;   // 100 m/s≈360 km/h：步行/自行车/原付/汽车/
+                                                    // 新干线全在此下；超过=野点。野点跳变通常
+                                                    // 上千 km/h，与真实移动隔着一个数量级，好分。
+static const uint32_t GLITCH_RESYNC_MS  = 30000UL;  // 参照点超 30s 没更新(丢过定位)→ 无从判断，
+                                                    // 放行并重建参照，避免复位后被旧点永久卡住。
+static const uint32_t GLITCH_FORCE_MS   = 4000UL;   // 连续丢弃持续超此时长仍在丢 → 认账，强制接受
+                                                    // 最新点重新对齐(KF 同步重置)，保证"真的远距离
+                                                    // 移动"最终跟得上、不锁死。按时长而非次数计，
+                                                    // 判据与采样率解耦(1Hz/5Hz 行为一致)。
+// 注：野点门的隐含速度分母 dt 有 1s 下限(见 gnssIsGlitch)——5Hz 采样下相邻样本 0.2s，
+// 几十米的多径步进按 0.2s 算会虚高成 >100m/s 被误杀；那是 NIS 门的活，本门只拦"1 秒尺度
+// 上仍超 100m/s"的千米级跳变。
+// 配置B 定位质量门：CGNSINF 直接给 HDOP/星数，弱解算(高 HDOP/少星)就别当"好定位"存进轨迹，
+// 从源头减少低精度散点。比 beaconDue 里防抖用的 HDOP_MAX(2.5) 宽松，只拦真正差的解。
+// 现场(阳台/户外)实测后可调这个数：偏严→点变少但更准；偏松→点更密但含更多散点。
+static const float    GNSS_HDOP_GOOD_B   = 4.0f;    // 配置B：HDOP ≤ 此 且 星数 ≥ SAT_MIN 才算好定位
+
+// 位置平滑（配置A/B 共用，见 track.ino gnssFeedLiveFix 统一入口）：0621/0711 两轮实测过
+// 中位数+速度自适应EMA(参见旧版本历史)，先后压住了"孤立跳变"和"慢走左右飘"两个问题的部分
+// 症状，但 0711 实测发现二者共享一个结构性根因——纯时间域低通/中位数滤波器分不清"多径造成
+// 的缓慢位置偏差"和"人真实的缓慢位移/转弯"，往细调平滑系数只是在"压噪声"和"转弯追不上、
+// 单步跳几公里"之间来回拉扯。改用二维匀速卡尔曼滤波(实现见 track.ino gnssKfSmooth)：显式
+// 维护位置+速度状态，不依赖任何模组自报字段(CGNSINF 的 spd 已证实会在真实高速移动中抽风
+// 报0)，噪声抑制与转弯响应由同一套状态估计自然分开，不是同一个旋钮的两端。上层读到的
+// spd/course 也从 KF 速度状态导出(见 gnssFeedLiveFix)，模组自报值只在 KF 起算第一拍过渡用。
+// 以下常量是这个滤波器的调参：
+static const float    KF_ACCEL_STD_MPS2 = 0.3f;      // 过程噪声：假设的加速度标准差(m/s²)，
+                                                      // 越大→越信任新测量/响应越快但抗噪弱；
+                                                      // 越小→越信任匀速模型/压噪声强但转弯滞后。
+                                                      // 0711 仿真：拐弯段滞后在 0.02~1.0 全范围
+                                                      // 都远优于旧算法(连续小滞后 vs 不连续大跳变)，
+                                                      // 取偏保守值向步行降噪倾斜；步行横向抑制本身
+                                                      // 在此范围内不敏感(仿真见下方说明)。
+static const float    KF_POS_SIGMA_M    = 4.0f;      // 测量噪声基准(米)：HDOP=1 时单次定位的
+                                                      // 假设标准差，实际 R = (此值 × HDOP)²
+static const double   KF_INIT_POS_VAR   = 25.0;      // 初始位置方差(米²)，= (5m)²，粗略起步值
+static const double   KF_INIT_VEL_VAR   = 2500.0;    // 初始速度方差((m/s)²)，= (50m/s)²，起步时
+                                                      // 完全不知道速度，给大值让前几拍快速收敛
+static const double   KF_REANCHOR_DIST_M = 3000.0;   // 局部平面坐标离原点超此距离(米)就重新锚定，
+                                                      // 避免长距离连续移动时经纬度换算精度衰减
+static const double   KF_NIS_GATE       = 9.0;        // innovation 一致性门(NIS，2自由度χ²，≈99%分位)：
+                                                      // 野点门只拦隐含速度>100m/s 的千米级跳变，几十米级
+                                                      // 多径跳变会全权重进滤波拽歪状态。归一化 innovation
+                                                      // 超此阈值时按倍数膨胀 R 降权。但只压"孤立"离群
+                                                      // (two-strike：连续第二拍触发就全权重放行)——持续
+                                                      // 超阈=真机动(急弯/加减速)，降权会拖住滤波不跟。
+                                                      // 0731 仿真：孤立50m跳变 17.2m→2.5m；急弯偏差与
+                                                      // 不加门持平(常开门版会恶化 ~3 倍)。见 gnssKfSmooth。
+static const float    KF_COURSE_MIN_KMH = 3.0f;       // KF 速度低于此值(km/h)时航向视为未知——静止/慢速下
+                                                      // 速度矢量方向是噪声，不能当 course 用
+static const float    ALT_EMA_ALPHA     = 0.2f;       // 高度一维 EMA 系数（高度单点噪声±10m 级，轻量低通足够）
+
 // ═══════════════════════════════════════════════════════════════════════════
 // Enums
 // ═══════════════════════════════════════════════════════════════════════════
@@ -178,6 +234,11 @@ struct LiveFix {
     uint8_t  sats        = 0;
     uint32_t tMs         = 0;       // 上次更新 millis（判新鲜度）
 };
+
+// GNSS 平滑用的单轴卡尔曼状态（位置m + 速度m/s），东/北各一份，配置A/B 共用。放这里(而非 track.ino
+// 局部)是因为 Arduino IDE 会把函数原型自动提到合并后 sketch 的最前面——若结构体在 track.ino
+// 里定义、又被同文件后面的函数当参数类型用，自动生成的原型会引用到"还没声明"的类型而编译失败。
+struct Kf1D { double p, v, Pxx, Pxv, Pvv; };
 
 // Store-and-forward track queue point.  Ring buffer: overwrites oldest when full.
 struct __attribute__((packed)) TrackPoint {
@@ -264,6 +325,12 @@ static int     fmtPoint(char* buf, int cap, const TrackPoint& p);
 static void    buildTrackPoint(TrackPoint& p);
 static void    recordAnchor();
 static bool    beaconDue(const char** why, bool* stopped);
+static bool    gnssIsGlitch(double lat, double lon, uint32_t nowMs);   // 野点判定(离群速度门)
+static void    gnssAcceptFix(double lat, double lon, uint32_t nowMs);  // 记为已接受定位(更新参照，必要时重置KF)
+static void    gnssKfSmooth(double lat, double lon, float hdop, uint32_t nowMs, double* outLat, double* outLon);  // 二维匀速卡尔曼滤波
+static void    gnssFeedLiveFix(double lat, double lon, uint32_t nowMs, float altM,
+                                bool haveSpd, float spdKmh, bool haveCourse, float courseDeg,
+                                bool haveHdop, float hdop, bool haveSats, uint8_t sats);  // 野点过滤+平滑→写liveFix，A/B共用入口
 
 // ── buttons.ino ──
 static void powerSaveShutdown();
@@ -274,7 +341,7 @@ static void atScan();
 static bool gnssWaitFix(uint32_t timeoutMs, int* sats, int* cn0);
 static void gnssSwitchTest();
 
-// ── 统一位置访问器（config_a.ino / config_b.ino 各一份实现）──
+// ── 统一位置访问器（实现见 track.ino，A/B 共用一份，读野点过滤+卡尔曼平滑后的 liveFix）──
 static bool    fixHasLoc();
 static double  fixLat();
 static double  fixLon();
@@ -310,6 +377,11 @@ static void flashLogBegin();
 static void flashLogAppend(const TrackPoint& p);
 static void flashLogCounts(uint16_t* sealedSegs, uint32_t* totalPoints);
 static int  flashLogUpload();
+
+#if !GNSS_TIMESHARE
+// ── config_a.ino 专有 ──
+static void gpsDrainStale();   // 长阻塞操作(发包/补发/开机初始化)后丢弃 RX 缓冲里的旧 NMEA
+#endif
 
 #if GNSS_TIMESHARE
 // ── flashlog.ino / config_b.ino 专有 ──

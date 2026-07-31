@@ -6,7 +6,7 @@
  *   defs.h           引脚·寄存器·枚举·调参常量·结构体 + 全部函数前置声明
  *   powerhub.ino     PowerHub I2C、电源/LED、电池换算、各 LED 刷新        〔共用〕
  *   catm.ino         SIM7080G AT 层：cmd/init/checkNet/syncTime/SHRecover/postBody 〔共用〕
- *   track.ino        存转队列 + 自适应 beacon 决策                          〔共用〕
+ *   track.ino        GNSS 野点门+卡尔曼平滑流水线 + 自适应 beacon 决策      〔共用〕
  *   pwrlog.ino       RTC 电量日志 + GNSS 信号解析 + 串口命令台              〔共用〕
  *   buttons.ino      按键状态机 + 省电关机                                  〔共用〕
  *   diag.ino         现场诊断：atScan / gnssWaitFix / gnssSwitchTest        〔共用〕
@@ -39,7 +39,7 @@
 //             腾出 PORT.C 给 LCD。位置靠 CGNSINF 轮询；发包时 GNSS↔LTE 切换。
 //   0 = 配置A：PORT.C 独立 ATGM336H 连续 NMEA + PORT.A 的 SIM7080G 专做 4G。
 // 换硬件改这一个数即可；两套逻辑分别在 config_a.ino / config_b.ino，互不影响。
-#define GNSS_TIMESHARE 1
+#define GNSS_TIMESHARE 0
 
 // 部署配置（APN / 服务器域名·端口·路径）抽到 config.h，不提交到 git。
 // 首次编译前：复制 config.example.h 为 config.h 并填入自己的值。
@@ -233,7 +233,12 @@ void setup() {
     }
     tLastSyncAttempt = millis();
 
-    configSetupPostNet();     // B：进 GNSS 跟踪 + 亮屏 | A：空
+    configSetupPostNet();     // B：进 GNSS 跟踪 + 亮屏 | A：丢弃 setup 阻塞期积压的旧 NMEA
+
+    // GPS 检测窗口(GPS_DETECT_MS)从 loop 真正开始起算。tBoot 首次赋值在 catmInit 之前，
+    // 而 catmInit+对时要阻塞 ~25s——不重置的话首轮 loop 时窗口已过期；以前靠解析积压旧
+    // NMEA"侥幸"通过检测，现在旧数据被 gpsDrainStale 丢弃(本该丢)，窗口必须从这里重新算。
+    tBoot = millis();
 
     Serial.println("[BOOT] Setup complete\n");
 }
@@ -331,7 +336,8 @@ void loop() {
 
     // ── CatM: adaptive GPS upload (SmartBeaconing + decay) ───────────────────
     // GPS is sampled continuously; only the send cadence adapts to motion.
-    // sendGpsData() blocks ~15-25 s; the GPS RX buffer absorbs NMEA meanwhile.
+    // sendGpsData() blocks ~15-25 s; 期间积压的 NMEA 会溢出 RX 缓冲(剩旧数据)，
+    // 由 sendGpsData 末尾的 gpsDrainStale() 整段丢弃，不喂给滤波流水线。
     if (catmReady && gpsState == GS_FIX_GOOD) {
         const char* why = nullptr;
         bool stopped = false;

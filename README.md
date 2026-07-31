@@ -1,6 +1,6 @@
 # M5Power APRS Tracker
 
-基于 **M5Stack AtomS3R + PowerHub** 的低功耗 GPS 轨迹追踪器。通过 Cat-M (LTE-M)
+基于 **M5Stack PowerHub** 的低功耗 GPS 轨迹追踪器。通过 Cat-M (LTE-M)
 蜂窝网络把定位点以 HTTPS POST 上报到自建服务器。支持两种硬件配置（编译期切换），
 断网积压**落 Flash 持久化、断电不丢**。
 
@@ -8,7 +8,7 @@
 
 | | **配置A**（`GNSS_TIMESHARE 0`，默认） | **配置B**（`GNSS_TIMESHARE 1`） |
 |---|---|---|
-| GPS 来源 | PORT.C **独立 GPS 模块**（ATGM336H，连续 NMEA） | PORT.A 的 **SIM7080G 二合一**内置 GNSS |
+| GPS 来源 | PORT.C **独立 GPS 模块**（ATGM336H，连续 NMEA，5Hz） | PORT.A 的 **SIM7080G 二合一**内置 GNSS |
 | 蜂窝 | PORT.A 的 SIM7080G **专做 4G** | 同一颗 SIM7080G **GNSS/LTE 分时**共用射频 |
 | PORT.C | GPS 模块 | 腾出来接 **Unit LCD 1.14"**（状态屏） |
 | 实时性 | **实时**：每个 beacon 立即直发 | 非实时：点先记 Flash，择机批量上传 |
@@ -22,8 +22,8 @@
 
 | 部件 | 接口 | 引脚 |
 |---|---|---|
-| AtomS3R（ESP32-S3 + 8MB PSRAM + 16MB Flash） | — | 主控 |
-| PowerHub | 内部 I2C 0x50（G45/G48） | 供电 / 电量计 / 按钮 / LED |
+| PowerHub 主控（ESP32-S3-WROOM-1U-N16R8，16MB Flash + 8MB PSRAM） | — | 跑本固件 |
+| PowerHub 协处理器（STM32G031G8U6） | 内部 I2C 0x50（G45/G48） | 供电 / 电量计 / 按钮 / LED（主控通过内部 I2C 读写） |
 | GPS 模块〔仅配置A〕 | PORT.C | G2←GPS TX, G1→GPS RX（UART 115200） |
 | Unit LCD 1.14"〔仅配置B〕 | PORT.C | I2C 0x3E（SDA=G2, SCL=G1） |
 | SIM7080G（Unit CatM） | PORT.A | G16←模块 TX, G15→模块 RX（UART 115200） |
@@ -31,6 +31,29 @@
 > 引脚 / 寄存器细节见 `firmware/defs.h`。
 
 ## 工作原理
+
+### GNSS 定位质量流水线（`track.ino`，配置A/B 共用）
+
+两种配置的原始定位（A: TinyGPS++ 解 ATGM336H **5Hz** NMEA / B: CGNSINF 轮询）都经
+`gnssFeedLiveFix()` 进同一条流水线，上层（beacon 决策 / 轨迹点 / 状态机）一律读平滑后的
+共享 `liveFix`：
+
+1. **野点门**（`gnssIsGlitch`）：与上一已接受点的隐含速度 > 100 m/s（任何交通方式达不到）
+   判为多径/坏星历野点丢弃。隐含速度的 dt 取 **1s 下限**，判据与采样率解耦（5Hz 下几十米
+   的多径步进不会被虚高成野点——那是 NIS 门的活）。三条兜底保证通用不锁死：无参照放行、
+   参照过旧(>30s)放行重建、连拒持续 4s 强制放行重新对齐——强制放行时 **KF 同步重置**
+   （位置已实跳远，不重置会吃公里级 innovation：位置拖影 + 速度状态被踢出上百 m/s 的过冲）。
+2. **二维匀速卡尔曼滤波**（`gnssKfSmooth`）：局部平面东/北各一维，显式估计位置+速度；
+   测量方差按 HDOP 缩放。带 **NIS(χ²) 门，two-strike 版**：几十米级多径跳变（过得了野点门）
+   按归一化 innovation 超阈倍数膨胀 R 自动降权，但连续第二拍触发就全权重放行——持续超阈
+   是真机动（急弯/加减速）而非多径尖刺。仿真：孤立 50m 跳变输出偏移 17.2m→2.5m，急弯
+   偏差与不加门持平（常开门版会恶化 ~3 倍）——压离群与跟机动解耦。
+3. **速度/航向从 KF 速度矢量导出**，不透传模组自报字段（CGNSINF 的 spd 实测高速抽风报 0，
+   NMEA 速度低速下也噪）；KF 起算第一拍用自报值过渡。慢速（<3 km/h）航向标未知。
+   高度走轻量 EMA。配置B 的"静止才 flush"判定同样受益。
+4. **阻塞后丢弃积压 NMEA**（仅配置A，`gpsDrainStale`）：发包阻塞 15-25s 必然溢出 4KB RX
+   缓冲（ESP32 丢最新留最旧），事后解析出的是"阻塞初期的旧位置"，配当前时间戳喂滤波会造成
+   假点/连拒。旧数据无价值（新鲜定位 1s 内就到），每个长阻塞操作结束后整段丢弃。
 
 ### 存转（store-and-forward）—— LittleFS 段日志（`flashlog.ino`）
 
@@ -64,7 +87,7 @@ defs.h         引脚·寄存器·枚举·调参常量·结构体 + 全部前置
 flushlogic.h   存转决策纯逻辑(flushDue)+调参常量（固件与 PC 仿真共用）
 catm.ino       SIM7080G AT 层：cmd/init/checkNet/syncTime/SH 会话+撞锁自愈   〔共用〕
 flashlog.ino   LittleFS 段日志：append/upload/磁盘满处理/计数               〔共用〕
-track.ino      点格式化 + 自适应 beacon 决策                                〔共用〕
+track.ino      GNSS 野点门+卡尔曼平滑流水线 + 点格式化 + beacon 决策        〔共用〕
 powerhub.ino   PowerHub I2C、电源/LED、电池换算                            〔共用〕
 pwrlog.ino     RTC 电量日志 + GNSS 信号解析 + 串口命令台                    〔共用〕
 buttons.ino    按键状态机 + 省电关机                                        〔共用〕

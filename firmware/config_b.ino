@@ -1,24 +1,11 @@
 // config_b.ino — 配置B 专属逻辑（仅当 GNSS_TIMESHARE==1 编译，否则整文件为空）。
 //   配置B = SIM7080G 二合一(Unit CatM GNSS)内置 GNSS 与 LTE 分时共用 PORT.A，
 //           腾出 PORT.C 给 Unit LCD 1.14"。位置靠 CGNSINF 轮询；发包时 GNSS↔LTE 切换。
-// 这里实现：位置访问器(读 liveFix)、CGNSINF 轮询、NMEA 采样诊断、GPS 状态机、分时发包、
-//   LCD 状态屏、catmWaitReg、以及 setup()/loop() 的配置钩子。
+// 这里实现：CGNSINF 轮询(接 gnssFeedLiveFix 共用流水线)、NMEA 采样诊断、GPS 状态机、
+//   分时发包、LCD 状态屏、catmWaitReg、以及 setup()/loop() 的配置钩子。
+// 位置访问器(fixLat/fixLon/...)已挪到 track.ino，A/B 共用一份实现。
 #include "defs.h"
 #if GNSS_TIMESHARE
-
-// ── 统一位置访问器：读 CGNSINF 轮询填好的 liveFix ────────────────────────────
-static inline bool    fixHasLoc()    { return liveFix.valid; }
-static inline double  fixLat()       { return liveFix.lat; }
-static inline double  fixLon()       { return liveFix.lon; }
-static inline float   fixAltM()      { return liveFix.altM; }
-static inline bool    fixHasSpeed()  { return liveFix.valid; }
-static inline float   fixSpdKmh()    { return liveFix.spdKmh; }
-static inline bool    fixHasHdop()   { return liveFix.valid; }
-static inline float   fixHdop()      { return liveFix.hdop; }
-static inline bool    fixHasSats()   { return liveFix.valid; }
-static inline uint8_t fixSats()      { return liveFix.sats; }
-static inline bool    fixHasCourse() { return liveFix.courseValid; }
-static inline float   fixCourseDeg() { return liveFix.courseDeg; }
 
 // ── 配置B flush 调度器状态（提前到此声明，供 LCD 渲染与调度器共用）─────────────
 static uint32_t flStillSince = 0;   // 进入静止的 millis（0 = 当前非静止）
@@ -43,7 +30,8 @@ static bool catmWaitReg(uint32_t timeoutMs) {
     }
 }
 
-// 轮询一次 CGNSINF，解析进 liveFix。仅在 GNSS 跟踪模式调用（CGNSPWR=1）。
+// 轮询一次 CGNSINF，解析后喂 gnssFeedLiveFix()（野点过滤+卡尔曼平滑，A/B共用，见 track.ino）。
+// 仅在 GNSS 跟踪模式调用（CGNSPWR=1）。
 // 字段: 0run 1fix 2utc 3lat 4lon 5alt 6spd 7course 8mode 10HDOP 14satsView 15satsUsed
 static void pollGnssIntoLiveFix() {
     String r = catmCmd("AT+CGNSINF", 3000);
@@ -56,23 +44,22 @@ static void pollGnssIntoLiveFix() {
         if (i == body.length() || body[i] == ',') { f[nf++] = body.substring(from, i); from = i + 1; }
     auto fld = [&](int i) -> String { return (i < nf) ? f[i] : String(); };
     if (fld(1).toInt() == 1) {
-        liveFix.valid       = true;
-        liveFix.lat         = atof(fld(3).c_str());      // atof=double，保住经纬度精度
-        liveFix.lon         = atof(fld(4).c_str());
-        liveFix.altM        = atof(fld(5).c_str());
-        liveFix.spdKmh      = atof(fld(6).c_str());
-        liveFix.courseValid = fld(7).length() > 0;
-        liveFix.courseDeg   = liveFix.courseValid ? atof(fld(7).c_str()) : -1.0f;
-        liveFix.hdop        = fld(10).length() ? atof(fld(10).c_str()) : 25.5f;
-        liveFix.sats        = (uint8_t)fld(14).toInt();
+        bool hasCourse = fld(7).length() > 0;
+        bool hasHdop   = fld(10).length() > 0;
+        gnssFeedLiveFix(atof(fld(3).c_str()), atof(fld(4).c_str()), millis(),
+                        atof(fld(5).c_str()),
+                        true, atof(fld(6).c_str()),
+                        hasCourse, hasCourse ? atof(fld(7).c_str()) : -1.0f,
+                        hasHdop, hasHdop ? atof(fld(10).c_str()) : 25.5f,
+                        true, (uint8_t)fld(14).toInt());
     } else {
         liveFix.valid = false;
         liveFix.sats  = (uint8_t)fld(14).toInt();   // 搜星中也记录可见星数（LCD 现场判断 + 天线代理）
+        liveFix.tMs   = millis();
     }
     // 维护"连续 0 可见星"计时：有星即清零；首次 0 星记起点 → LCD 据此判 ANT? 天线告警。
     if (liveFix.sats > 0) tSatsZeroSince = 0;
     else if (tSatsZeroSince == 0) tSatsZeroSince = millis();
-    liveFix.tMs = millis();
 }
 
 // 配置B：CGNSINF 不带每星 CN0/星座。临时开 NMEA 流(CGNSTST=1)抓 ~1.5s 的 GSV/TXT，
@@ -125,7 +112,11 @@ static void gnssNmeaTest() {
 // ═══════════════════════════════════════════════════════════════════════════
 static void updateGps() {
     if (gpsState == GS_DETECTING) gpsState = GS_SEARCHING;   // 无检测期
-    bool good = liveFix.valid && (millis() - liveFix.tMs < 5000);
+    // 定位质量门：有效 + 新鲜(5s 内) + HDOP/星数达标才算"好定位"。弱解算(高 HDOP/少星)
+    // 只当搜星，不进 GS_FIX_GOOD → 不会被 beacon 存进轨迹，从源头压低散点、提升精度。
+    // 阈值 GNSS_HDOP_GOOD_B/SAT_MIN 现场可调（见 defs.h）。
+    bool good = liveFix.valid && (millis() - liveFix.tMs < 5000)
+                && liveFix.hdop <= GNSS_HDOP_GOOD_B && liveFix.sats >= SAT_MIN;
     if (good && gpsState != GS_FIX_GOOD)
         Serial.printf("[GPS] Fix lat=%.6f lon=%.6f hdop=%.1f sat=%u (7080G)\n",
                       liveFix.lat, liveFix.lon, liveFix.hdop, liveFix.sats);
@@ -165,7 +156,7 @@ static void lcdInit() {
         }
     }
     if (!lcdOK) { Serial.println("[LCD] init FAIL（检查 PORT.C 接线/供电）"); return; }
-    lcd.setRotation(0);                 // 0 = 竖屏 135(宽) x 240(高)
+    lcd.setRotation(2);                 // 2 = 竖屏 135x240 原地上下颠倒(180°)，配合模块反装朝向
     lcd.setBrightness(LCD_BRIGHTNESS);
     lcd.fillScreen(BLACK);
     // 离屏画布：优先 PSRAM，失败回退内部 RAM；都失败则直接画到屏（会略闪）。

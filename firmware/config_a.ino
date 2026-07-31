@@ -1,22 +1,10 @@
 // config_a.ino — 配置A 专属逻辑（仅当 GNSS_TIMESHARE==0 编译，否则整文件为空）。
 //   配置A = PORT.C 独立 ATGM336H 连续 NMEA + PORT.A 的 SIM7080G 专做 4G。
-// 这里实现：位置访问器(读 TinyGPS++)、GPS 状态机、发包、以及 setup()/loop() 的配置钩子。
+// 这里实现：GPS 状态机、发包、以及 setup()/loop() 的配置钩子。
+// 位置访问器(fixLat/fixLon/...)已挪到 track.ino，A/B 共用一份实现，读野点过滤+卡尔曼平滑
+// 之后的 liveFix；本文件只在 configLoopFeed() 里把 TinyGPS++ 解出的原始定位喂进那套流水线。
 #include "defs.h"
 #if !GNSS_TIMESHARE
-
-// ── 统一位置访问器：直接读 TinyGPS++ 的 gps 对象 ─────────────────────────────
-static inline bool    fixHasLoc()    { return gps.location.isValid(); }
-static inline double  fixLat()       { return gps.location.lat(); }
-static inline double  fixLon()       { return gps.location.lng(); }
-static inline float   fixAltM()      { return gps.altitude.meters(); }
-static inline bool    fixHasSpeed()  { return gps.speed.isValid(); }
-static inline float   fixSpdKmh()    { return gps.speed.kmph(); }
-static inline bool    fixHasHdop()   { return gps.hdop.isValid(); }
-static inline float   fixHdop()      { return gps.hdop.hdop(); }
-static inline bool    fixHasSats()   { return gps.satellites.isValid(); }
-static inline uint8_t fixSats()      { return gps.satellites.value(); }
-static inline bool    fixHasCourse() { return gps.course.isValid(); }
-static inline float   fixCourseDeg() { return gps.course.deg(); }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // GPS state machine update（PORT.C 连续 NMEA）
@@ -50,17 +38,17 @@ static void updateGps() {
     }
 
     // Searching ↔ fix good
-    // Use location.age() rather than HDOP: HDOP is only committed by TinyGPS++
-    // when GGA already has fix quality > 0, creating a circular dependency.
-    // A fresh valid position (updated within the last 5 s) means we have a fix.
+    // 用 liveFix 的新鲜度(而非直接读 gps.location)：fixLat()/fixLon() 现在读的是野点过滤+
+    // 卡尔曼平滑之后的 liveFix（见 track.ino gnssFeedLiveFix），状态机也该跟着同一份数据走，
+    // 否则会出现"状态机说有定位，但实际 fixLat() 还停在上一个野点过滤前的旧值"的不一致。
+    // liveFix.tMs 由 gnssFeedLiveFix() 在每次真正接受(非野点)的新定位时刷新，语义等价于
+    // 原来的 gps.location.age()<5000。
     if (gpsState == GS_SEARCHING || gpsState == GS_FIX_GOOD) {
-        bool good = gps.location.isValid() && gps.location.age() < 5000;
+        bool good = liveFix.valid && (millis() - liveFix.tMs < 5000);
 
         if (good && gpsState != GS_FIX_GOOD) {
             Serial.printf("[GPS] Fix  lat=%.6f lon=%.6f hdop=%.1f sat=%u\n",
-                gps.location.lat(), gps.location.lng(),
-                gps.hdop.isValid() ? gps.hdop.hdop() : -1.0f,
-                gps.satellites.isValid() ? gps.satellites.value() : 0);
+                liveFix.lat, liveFix.lon, liveFix.hdop, liveFix.sats);
         } else if (!good && gpsState == GS_FIX_GOOD) {
             Serial.println("[GPS] Fix lost");
         }
@@ -86,6 +74,25 @@ static void updateGps() {
                 gps.charsProcessed(), gps.passedChecksum(), rtcStr);
         }
     }
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// 长阻塞操作(发包/补发/开机初始化)结束后调用：把阻塞期间积压的 NMEA 整段丢弃。
+//
+// 为什么必须丢：RX 缓冲 4096B 只够吸收 ~5-10s 的三系统 NMEA(GSV 全开约 400-900B/s)，
+// 而发包阻塞 15-25s、恢复补发更久——溢出几乎必然。ESP32 HardwareSerial 溢出时**丢最新、
+// 留最旧**，事后排空解析出的"最后一个定位"其实是阻塞初期的旧位置；若配上当前 millis 喂进
+// 滤波流水线，就是"旧位置新时间戳"：步行时注入 ~20m 假点(恰是在治的漂移量级)，电车速度下
+// 假点与 1s 后真定位的隐含速度会超 GLITCH_MAX_MPS → 野点门连拒→强制放行→KF 重置，每次
+// 发包后都白白折腾一轮。旧数据本无价值(下一个新鲜定位 1s 内就到)，整段丢弃最干净；丢弃
+// 造成的 dt(~25s) 走 KF 大方差预测路径，天然安全（>30s 则由 GLITCH_RESYNC 重建，也安全）。
+// 丢弃可能截断半句 NMEA，TinyGPS++ 在下一个 '$' 自动重新同步，无需处理。
+// ═══════════════════════════════════════════════════════════════════════════
+static void gpsDrainStale() {
+    uint32_t n = 0;
+    while (gpsSerial.available()) { gpsSerial.read(); n++; }
+    if (n) Serial.printf("[GPS] drained %lu stale NMEA bytes after blocking op\n",
+                         (unsigned long)n);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -116,6 +123,7 @@ static bool sendGpsData(bool queueOnFail) {
         refreshCatmLed();
         catmFailStreak++;
         if (queueOnFail) flashLogAppend(cur);   // 发失败(无信号) → 落 Flash 段日志(断电不丢)
+        gpsDrainStale();   // checkNet 重试也阻塞了几十秒 → 丢弃积压的旧 NMEA
         return false;
     }
 
@@ -141,6 +149,7 @@ static bool sendGpsData(bool queueOnFail) {
         refreshCatmLed();
         if (queueOnFail) flashLogAppend(cur);   // 发失败(无信号) → 落 Flash 段日志(断电不丢)
     }
+    gpsDrainStale();   // 发包阻塞 15-25s 必溢出 RX 缓冲 → 丢弃旧 NMEA，只吃新鲜定位
     return ok;
 }
 
@@ -151,7 +160,10 @@ static bool sendGpsData(bool queueOnFail) {
 // setup：CatM UART 之后 → 开 PORT.C 的 GPS 串口 + 一次性配置 GPS 模块。
 static void configSetupEarly() {
     // ── GPS serial ───────────────────────────────────────────────────────────
-    gpsSerial.setRxBufferSize(4096);   // 大缓冲：发包/恢复补发会阻塞，吸收期间的 NMEA（~40s 余量）
+    // RX 缓冲 4096B 只够吸收 ~5-10s 的三系统 NMEA(约 400-900B/s)，撑不过 15-25s 的发包
+    // 阻塞——溢出后缓冲里剩的是"阻塞初期"的旧数据(ESP32 丢最新留最旧)。所以不指望它保数据：
+    // 各阻塞操作结束后一律 gpsDrainStale() 整段丢弃，绝不把旧定位当新鲜数据喂滤波。
+    gpsSerial.setRxBufferSize(4096);
     gpsSerial.begin(115200, SERIAL_8N1, GPS_RX_PIN, GPS_TX_PIN);
     Serial.println("[GPS] UART1 started — 115200 8N1");
 
@@ -164,20 +176,25 @@ static void configSetupEarly() {
     //   配置写进模块自身 flash(PCAS00)。之后每次开机不发任何 GPS 命令 →
     //   模块凭 VBAT 后备星历热启动(≤1s, 灵敏度 -156dBm，比冷启动 -148 高 8dB)。
     // PCAS04 位掩码: GPS=1 BDS=2 GLONASS=4 Galileo=8 → 15=四系统全开(QZSS 随 GPS L1)。
+    // PCAS02,200 = 定位更新间隔 200ms(5Hz)：采样多 5 倍给 KF 平均增益，拐弯响应更细。
+    //   流量涨到 ~4.5KB/s(GSV 也 5Hz)，115200 波特(11.5KB/s)吃得下；阻塞期旧数据本就由
+    //   gpsDrainStale 丢弃，野点门 dt 也已做 1s 下限解耦——5Hz 的前置条件都已就位。
     {
-        const uint8_t GPS_CFG_VER = 2;     // 改配置时 +1，强制下次开机重配一次
+        const uint8_t GPS_CFG_VER = 3;     // 改配置时 +1，强制下次开机重配一次
         Preferences gpsPrefs;
         gpsPrefs.begin("gps", false);
         if (gpsPrefs.getUChar("cfgver", 0) != GPS_CFG_VER) {
             delay(200);
             gpsSerial.print("$PCAS10,9*15\r\n");   // 一次性出厂启动 + 使能串口&射频
-            delay(500);
+            delay(500);                            //  (清星历→本次冷启动一回，之后热启动)
             gpsSerial.print("$PCAS04,15*2D\r\n");  // GPS(+QZSS)+BDS+GLONASS+Galileo 全开
+            delay(100);
+            gpsSerial.print("$PCAS02,200*1D\r\n"); // 5Hz 定位更新
             delay(100);
             gpsSerial.print("$PCAS00*01\r\n");     // 存入模块 flash，掉电不丢
             delay(200);
             gpsPrefs.putUChar("cfgver", GPS_CFG_VER);
-            Serial.println("[GPS] one-time config: RF + GPS/QZSS+BDS+GLONASS+Galileo, saved");
+            Serial.println("[GPS] one-time config: RF + 4-GNSS + 5Hz, saved");
         } else {
             Serial.println("[GPS] config persisted -> hot start (no re-config this boot)");
         }
@@ -185,9 +202,11 @@ static void configSetupEarly() {
     }
 }
 
-// 配置A 在这两个时机无事可做（LCD / GNSS 跟踪是配置B 专属）。
+// 配置A 在 PreNet 时机无事可做（LCD / GNSS 跟踪是配置B 专属）。
 static void configSetupPreNet()  {}
-static void configSetupPostNet() {}
+// setup 里 catmInit+对时阻塞了 10-30s，期间 GPS 串口已开、NMEA 已在积压——同发包后一样
+// 丢弃旧数据，避免开机第一个定位就是"旧位置新时间戳"（开机就在电车上时会触发连拒）。
+static void configSetupPostNet() { gpsDrainStale(); }
 
 // loop 顶：喂 GPS 解析器（每轮都跑，最高优先级；RX 缓冲在发包阻塞期吸收 NMEA）。
 static void configLoopFeed(uint32_t now) {
@@ -206,6 +225,17 @@ static void configLoopFeed(uint32_t now) {
         } else {
             nmeaLen = 0;   // 行超长，丢弃
         }
+    }
+    // TinyGPS++ 刚解出一个新定位 → 喂野点过滤+卡尔曼平滑，写共享 liveFix(见 track.ino
+    // gnssFeedLiveFix)。isUpdated() 读一次即自清，和 isValid()/age() 是各自独立的标志，
+    // 不影响别处（比如下面 updateGps 的搜星诊断日志）继续读 gps.location 的原始状态。
+    if (gps.location.isUpdated() && gps.location.isValid()) {
+        gnssFeedLiveFix(gps.location.lat(), gps.location.lng(), now,
+                        gps.altitude.isValid() ? gps.altitude.meters() : 0.0f,
+                        gps.speed.isValid(), gps.speed.isValid() ? gps.speed.kmph() : 0.0f,
+                        gps.course.isValid(), gps.course.isValid() ? gps.course.deg() : -1.0f,
+                        gps.hdop.isValid(), gps.hdop.isValid() ? gps.hdop.hdop() : 25.5f,
+                        gps.satellites.isValid(), gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0);
     }
 }
 
@@ -260,6 +290,7 @@ static void configLoopRecover(uint32_t now) {
                 catmFailStreak++;     // 仍发不出，保持红，下个周期再试
             }
         }
+        gpsDrainStale();   // 重附着/补发都长阻塞 → 丢弃期间积压的旧 NMEA
     }
 }
 
