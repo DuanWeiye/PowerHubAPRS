@@ -469,16 +469,43 @@ static bool catmSHRecover() {
     return reg && ip;
 }
 
-// 打开一个 HTTPS(SH)会话：SHCONF/SSL 配置 + SHCONN 建链。若首次 SHCONN 命中 SH
-// 锁死（operation not allowed），CFUN=1,1 整模块重启后把整段重做一遍再连（见
-// catmSHRecover）。成功（SHSTATE=1）返回 true。
+// SH 锁轻量恢复：CFUN=0→1 射频重启 + 重注册 + 重建承载。
+// 2026-08-02 台面钉死："SH 锁"实为 CGNSPWR 射频切换后 LTE 数据面整体坏死——
+// ping/DNS/TCP 全断，CEREG/CNACT 却显示正常（假象）；SHCONN 的 operation not
+// allowed 只是同一底层故障的报错皮。不干预约 65s 自愈；CNACT 0,0/0,1 toggle
+// 无效（40ms 秒切同 IP，没真重协商）；CFUN=0/1 实测 ~8s 一发解锁。旧结论
+// "CFUN=0/1 只换来再放行一次 SHCONN"在会话复用（每 flush 仅一次 SHCONN）下
+// 恰好够用。仍锁由调用方升级 CFUN=1,1。详见 SIM7080G_GUIDE.md §13。
+static bool catmRfRecycle() {
+    Serial.println("[CM] SH 锁 → 轻量恢复：CFUN=0/1 射频重启");
+    catmCmd("AT+CFUN=0", 10000);
+    delay(500);
+    catmCmd("AT+CFUN=1", 10000);
+    delay(1000);
+    bool reg = false;                     // 等重注册（一般 1~3s）
+    for (int i = 0; i < 12 && !reg; i++) {
+        String r = catmCmd("AT+CEREG?", 2000);
+        int c = r.indexOf(',');
+        if (c >= 0 && (r[c+1] == '1' || r[c+1] == '5')) reg = true;
+        else delay(1500);
+    }
+    catmCmd("AT+CNCFG=0,1,\"" CATM_APN "\"", 3000);   // CFUN=0 已断 PDP，重建
+    catmCmd("AT+CNACT=0,1", 15000);
+    delay(1000);
+    return reg && catmHasIPv4(catmCmd("AT+CNACT?", 3000));
+}
+
+// 打开一个 HTTPS(SH)会话：SHCONF/SSL 配置 + SHCONN 建链。SHCONN 命中 SH 锁
+// （operation not allowed）时按代价升级自愈：先 catmRfRecycle（CFUN=0/1 射频重
+// 启，~8s，不重启模块），仍锁才 catmSHRecover（CFUN=1,1 整模块重启，~35s 兜底）。
+// 每次自愈后把整段配置重做一遍再连。成功（SHSTATE=1）返回 true。
 // ★会话复用：打开一次后可连发多次 catmSHReq，最后 catmSHClose 一次——这样上传一批
 //   积压只做一次 TLS 握手，而不是每 8 个点重建一次（实测每次握手 0.8~2.4s，是大批量
 //   上传的主要耗时；改造前 200 点要 30 次握手 ~75s）。bodyCap = SHCONF BODYLEN（≥单条
 //   body；SIM7080G 上限 1024），整个会话设一次即可。
 static bool catmSHOpen(int bodyCap) {
     bool connected = false;
-    for (int attempt = 0; attempt < 2 && !connected; attempt++) {
+    for (int attempt = 0; attempt < 3 && !connected; attempt++) {
         catmCmd("AT+SHDISC", 3000);
         delay(500);
         catmCmd("AT+SHCONF=\"URL\",\"" SERVER_BASE "\"", 5000);
@@ -489,12 +516,18 @@ static bool catmSHOpen(int bodyCap) {
         catmCmd("AT+CSSLCFG=\"sni\",1,\"" SERVER_HOST "\"", 3000);
         catmCmd("AT+SHSSL=1,\"\"", 3000);
 
-        String shret = catmCmd("AT+SHCONN", 10000);
+        // 超时 15s：锁死失败实测最长 ~10.2s 才回 CME，10s 超时会漏读错误串→不走自愈
+        String shret = catmCmd("AT+SHCONN", 15000);
         if (shret.indexOf("|OK|") >= 0) { connected = true; break; }
 
-        if (attempt == 0 && shret.indexOf("operation not allowed") >= 0) {
-            Serial.println("[CM] SHCONN 'operation not allowed' → SH 栈锁死，CFUN=1,1 恢复后重试");
-            catmSHRecover();          // 整模块重启解锁；下一轮 for 重建 SH 会话再连
+        if (attempt < 2 && shret.indexOf("operation not allowed") >= 0) {
+            if (attempt == 0) {
+                Serial.println("[CM] SHCONN 锁死 → CFUN=0/1 轻量恢复后重试");
+                catmRfRecycle();      // 失败也继续重试；再锁下一轮升级 CFUN=1,1
+            } else {
+                Serial.println("[CM] 轻量恢复仍锁 → CFUN=1,1 整模块重启后重试");
+                catmSHRecover();
+            }
         } else {
             Serial.printf("[CM] SHCONN fail — CEER=%s\n", catmCmd("AT+CEER", 2000).c_str());
             break;
