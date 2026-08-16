@@ -6,8 +6,21 @@
 // GNSS 信号诊断解析（解析一整行 NMEA）
 // 只看 GSV（星座/CN0/可见星数）与 TXT（天线状态）；不碰 TinyGPS++（它另收同样字节）。
 // ═══════════════════════════════════════════════════════════════════════════
+// NMEA 校验和验证。链上 S3R 写 Flash 瞬间偶尔掉字节（坏行原样转发），字段错位会把
+// 方位角(0-359)当 CN0、垃圾值当可见星数记进电量日志（实测出现过 cn0=213/sats=111），
+// 坏行必须在解析前拦掉。TinyGPS++ 自带校验不受影响，这里只管诊断解析这条路。
+static bool nmeaCsOk(const char* s) {
+    uint8_t cs = 0;
+    const char* p = s + 1;
+    for (; *p && *p != '*'; p++) cs ^= (uint8_t)*p;
+    if (*p != '*' || !isxdigit((unsigned char)p[1]) || !isxdigit((unsigned char)p[2]))
+        return false;
+    return (uint8_t)strtol(p + 1, nullptr, 16) == cs;
+}
+
 static void gnssDiagLine(const char* s) {
     if (s[0] != '$') return;
+    if (!nmeaCsOk(s)) return;                     // 坏行直接丢，不污染诊断计数
     const char* ty = s + 3;                       // 句型在 talker(2) 之后
     if (ty[0]=='T' && ty[1]=='X' && ty[2]=='T') { // 天线状态 $xxTXT,...,ANTENNA OK/OPEN/SHORT
         if      (strstr(s, "ANTENNA OK"))    gnssAnt = 1;
@@ -137,7 +150,9 @@ static void checkSerialCommands() {
             buf[len] = 0; len = 0;
             // 原始 AT 透传：以 "at"/"AT" 开头的整行（保留大小写）直接转发给模组，
             // 打印应答。用于现场对锁死/异常的 SIM7080G 逐条试探与恢复实验。
-            if ((buf[0] == 'a' || buf[0] == 'A') && (buf[1] == 't' || buf[1] == 'T')) {
+            // 例外："atscan" 是本机命令，不能被当成 AT 行吞掉。
+            if ((buf[0] == 'a' || buf[0] == 'A') && (buf[1] == 't' || buf[1] == 'T')
+                    && strcasecmp(buf, "atscan") != 0) {
                 Serial.printf("[AT>] %s\n", buf);
                 Serial.printf("[AT<] %s\n", catmCmd(String(buf), 16000).c_str());
                 continue;
@@ -148,6 +163,27 @@ static void checkSerialCommands() {
             else if (!strcmp(buf, "sendtest"))  { forceSendReq = true; Serial.println("[CMD] 强制发包"); }
             else if (!strcmp(buf, "gnsstest")) gnssSwitchTest();
             else if (!strcmp(buf, "atscan"))   atScan();
+#if !GNSS_TIMESHARE
+            // ── S3R 协处理器链路（配置A：PORT.C，见 config_a.ino s3r*）──
+            else if (!strcmp(buf, "s3rbridge")) s3rBridgeMode();
+            else if (!strcmp(buf, "s3rping")) {
+                gpsSerial.print("$S3R,PING\r\n");
+                Serial.println("[S3R] PING 已发（应答见 [S3R] 行；GPS 直连时无应答）");
+            }
+            else if (!strcmp(buf, "s3rinfo")) {
+                gpsSerial.print("$S3R,INFO\r\n");
+                Serial.println("[S3R] INFO 已发（应答见 [S3R] 行；GPS 直连时无应答）");
+            }
+            else if (!strcmp(buf, "s3rimu")) {
+                gpsSerial.print("$S3R,IMU\r\n");
+                Serial.println("[S3R] IMU 查询已发（应答见 [S3R] 行）");
+            }
+            else if (!strcmp(buf, "s3rfuse on") || !strcmp(buf, "s3rfuse off")) {
+                bool on = (buf[8] == 'o' && buf[9] == 'n');
+                gpsSerial.printf("$S3R,FUSE,%s\r\n", on ? "ON" : "OFF");
+                Serial.printf("[S3R] FUSE %s 已发（应答见 [S3R] 行）\n", on ? "ON" : "OFF");
+            }
+#endif
 #if GNSS_TIMESHARE
             // ── 配置B 段日志台面实测命令（室内无 GPS，灌假点量上传耗时）──
             else if (!strncmp(buf, "flfill", 6)) {
@@ -176,7 +212,8 @@ static void checkSerialCommands() {
             else if (!strcmp(buf, "help")) Serial.println(
                 "[CMD] log|logclear|sendtest|at<cmd>|gnsstest|atscan | flfill<n>|flflush|flstat|flclear|flhold | help");
 #else
-            else if (!strcmp(buf, "help"))     Serial.println("[CMD] log | logclear | sendtest | at<cmd> | gnsstest | atscan | help");
+            else if (!strcmp(buf, "help"))     Serial.println(
+                "[CMD] log|logclear|sendtest|at<cmd>|gnsstest|atscan | s3rbridge|s3rping|s3rinfo|s3rfuse on/off | help");
 #endif
             else Serial.printf("[CMD] unknown: '%s' (try: help)\n", buf);
         } else if (len < sizeof(buf) - 1) {

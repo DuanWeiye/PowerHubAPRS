@@ -91,8 +91,11 @@ static void updateGps() {
 static void gpsDrainStale() {
     uint32_t n = 0;
     while (gpsSerial.available()) { gpsSerial.read(); n++; }
-    if (n) Serial.printf("[GPS] drained %lu stale NMEA bytes after blocking op\n",
-                         (unsigned long)n);
+    if (n) {
+        tLastNmeaByte = millis();   // 丢的也是流——链路看门狗只关心"有没有流"
+        Serial.printf("[GPS] drained %lu stale NMEA bytes after blocking op\n",
+                      (unsigned long)n);
+    }
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -200,6 +203,9 @@ static void configSetupEarly() {
         }
         gpsPrefs.end();
     }
+
+    // S3R 链路计时基准（看门狗 3min ≫ setup 阻塞 ~25s，从这里起算即可）
+    tLastNmeaByte = tLastS3rPing = millis();
 }
 
 // 配置A 在 PreNet 时机无事可做（LCD / GNSS 跟踪是配置B 专属）。
@@ -210,22 +216,30 @@ static void configSetupPostNet() { gpsDrainStale(); }
 
 // loop 顶：喂 GPS 解析器（每轮都跑，最高优先级；RX 缓冲在发包阻塞期吸收 NMEA）。
 static void configLoopFeed(uint32_t now) {
+    bool gotBytes = false;
     while (gpsSerial.available()) {
         char c = gpsSerial.read();
+        gotBytes = true;
         gps.encode(c);
         // Raw NMEA dump for the first GPS_RAW_DUMP_MS — helps diagnose
         // whether the module sees any satellites (look for $GNGSV SNR values).
         if (now - tBoot < GPS_RAW_DUMP_MS)
             Serial.write(c);
-        // 装配整行 NMEA → 喂 GNSS 信号诊断（CN0/星座/天线，进电量日志）
+        // 装配整行 → $S3R 协议行给链路处理，其余喂 GNSS 信号诊断（CN0/星座/天线）
         if (c == '\n' || c == '\r') {
-            if (nmeaLen) { nmeaLine[nmeaLen] = 0; gnssDiagLine(nmeaLine); nmeaLen = 0; }
+            if (nmeaLen) {
+                nmeaLine[nmeaLen] = 0;
+                if (!strncmp(nmeaLine, "$S3R,", 5)) s3rLinkLine(nmeaLine);
+                else                                gnssDiagLine(nmeaLine);
+                nmeaLen = 0;
+            }
         } else if (nmeaLen < sizeof(nmeaLine) - 1) {
             nmeaLine[nmeaLen++] = c;
         } else {
             nmeaLen = 0;   // 行超长，丢弃
         }
     }
+    if (gotBytes) tLastNmeaByte = now;   // 链路看门狗的"有流"时间戳
     // TinyGPS++ 刚解出一个新定位 → 喂野点过滤+卡尔曼平滑，写共享 liveFix(见 track.ino
     // gnssFeedLiveFix)。isUpdated() 读一次即自清，和 isValid()/age() 是各自独立的标志，
     // 不影响别处（比如下面 updateGps 的搜星诊断日志）继续读 gps.location 的原始状态。
@@ -237,6 +251,7 @@ static void configLoopFeed(uint32_t now) {
                         gps.hdop.isValid(), gps.hdop.isValid() ? gps.hdop.hdop() : 25.5f,
                         gps.satellites.isValid(), gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0);
     }
+    s3rLinkTick(now);   // S3R 心跳 + NMEA 断流看门狗
 }
 
 // 配置A 无 LCD、采样前无需抓 NMEA（GPS 流里已带 GSV）。
@@ -309,6 +324,73 @@ static void configForceUpload() {
     sendGpsData(false);          // bench/diagnostic：不污染轨迹队列
     recordAnchor();
     decayInterval = DECAY_START_MS;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// S3R 协处理器链路：透传桥 / 心跳 / 链路看门狗（见 s3r/HANDOFF.md 待办1）
+// GPS 可能直连 PORT.C 也可能经 AtomS3R 转接，三件对两种接法都成立。
+// ═══════════════════════════════════════════════════════════════════════════
+
+// 链路上收到 $S3R 行（心跳应答 PONG / OTA 确认 CONFIRMED / INFO 应答…）→ 记存活+打日志。
+// 行频最高 1 条/分钟（心跳应答），直接全量进日志，联测/排障都用得上。
+static void s3rLinkLine(const char* s) {
+    tS3rLastSeen = millis();
+    Serial.printf("[S3R] %s\n", s);
+}
+
+// 每 ~60s 心跳 + NMEA 断流看门狗（configLoopFeed 末尾每轮调用）
+static void s3rLinkTick(uint32_t now) {
+    // 心跳：S3R 收到即确认待确认固件（OTA 防变砖闭环）并回 PONG；GPS 直连时
+    // ATGM336H 忽略未知语句，无害。
+    if (now - tLastS3rPing >= S3R_PING_MS) {
+        tLastS3rPing = now;
+        gpsSerial.print("$S3R,PING\r\n");
+    }
+    // 链路看门狗：NMEA 断流超阈值 → PORT.C 断电重启整链（S3R+GPS 或裸 GPS 同样适用）。
+    // 长阻塞操作（发包 15-25s、恢复补发）后 gpsDrainStale 会刷新时间戳，不会误触发。
+    if (now - tLastNmeaByte >= S3R_LINK_WDT_MS) {
+        Serial.printf("[S3R] link watchdog: NMEA 断流 %lus → PORT.C 断电 %lums 重启整链\n",
+                      (unsigned long)((now - tLastNmeaByte) / 1000),
+                      (unsigned long)S3R_WDT_OFF_MS);
+        phPower(PC_UART, false);
+        delay(S3R_WDT_OFF_MS);
+        phPower(PC_UART, true);
+        gpsDrainStale();
+        tLastNmeaByte = millis();
+        // 卡在 NO_MODULE 的状态机不再参与检测；断电重启后给一次重新检测的机会。
+        // （INIT_FAIL 不重置：TinyGPS 校验计数累计，坏流未修好会立即再判失败，无意义。）
+        if (gpsState == GS_NO_MODULE) {
+            gpsState = GS_DETECTING;
+            tBoot = millis();   // 检测窗口重新起算（raw dump 起点复用同一基准，无碍）
+        }
+    }
+}
+
+// USB↔PORT.C 透传桥：给装机后的 S3R 做 UART-OTA。ota_flash.py 开口后先发一行
+// "s3rbridge" 进入本模式，之后字节原样双向转发（协议见 s3r/ota_flash.py 头注释）。
+// 阻塞独占 loop：期间 LED/按键/beacon/喂流全部暂停——维护操作，可接受。
+// 空闲退出而非命令退出：刷完后不再有 USB 数据，60s 后自动恢复正常运行。
+static void s3rBridgeMode() {
+    Serial.printf("[S3R] bridge: USB<->PORT.C 透传开始（%lus 无 USB 数据自动退出）\n",
+                  (unsigned long)(S3R_BRIDGE_IDLE_MS / 1000));
+    gpsDrainStale();               // 只转发新鲜字节
+    uint8_t buf[256];
+    uint32_t tUsb = millis();
+    for (;;) {
+        // USB → 链路（256B 一批；UART 115200 写满阻塞 ~22ms，反压由 USB-CDC NAK 兜住）
+        int n = 0;
+        while (n < (int)sizeof(buf) && Serial.available()) buf[n++] = (uint8_t)Serial.read();
+        if (n) { gpsSerial.write(buf, n); tUsb = millis(); }
+        // 链路 → USB（NMEA 噪声混在其中，ota_flash.py 侧按 $S3R 前缀过滤）
+        int m = 0;
+        while (m < (int)sizeof(buf) && gpsSerial.available()) buf[m++] = (uint8_t)gpsSerial.read();
+        if (m) Serial.write(buf, m);
+        if (millis() - tUsb >= S3R_BRIDGE_IDLE_MS) break;
+        if (!n && !m) delay(1);    // 空转让出 CPU，喂 RTOS 看门狗
+    }
+    Serial.println("[S3R] bridge: 空闲超时退出，恢复正常运行");
+    gpsDrainStale();
+    tLastNmeaByte = millis();      // 桥内没喂解析器 → 重置看门狗基准，避免退出即误触发
 }
 
 #endif  // !GNSS_TIMESHARE

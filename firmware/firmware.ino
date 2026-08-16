@@ -77,13 +77,22 @@ static uint32_t  tDisplayOff  = 0;        // 自动息屏时刻（millis）
 static uint32_t  tLastLcdDraw = 0;        // 上次重绘时刻
 #endif
 
+#if !GNSS_TIMESHARE
+// ── S3R 协处理器链路状态（配置A：透传桥/心跳/看门狗，实现见 config_a.ino s3r*）────
+// GPS 可能直连 PORT.C，也可能经 AtomS3R 协处理器转接（s3r/README.md）——三件对两种
+// 接法都成立：心跳语句 ATGM336H 会忽略；看门狗只看 NMEA 断流；桥只是原样转发字节。
+static uint32_t tLastNmeaByte = 0;   // 最近一次从 PORT.C 收到字节（链路看门狗判断流）
+static uint32_t tLastS3rPing  = 0;   // 上次发 $S3R,PING 心跳
+static uint32_t tS3rLastSeen  = 0;   // 上次收到 $S3R 行（0=从未；GPS 直连时恒 0）
+#endif
+
 // ── GNSS 信号诊断（从 GSV/TXT 自解析，由电量日志按采样间隔快照）─────────────────
 // 槽位: 0=GPS 1=GLONASS 2=BDS北斗 3=Galileo 4=QZSS 5=SBAS/其它
 static uint8_t gnssInView[6] = {0};  // 各系统可见卫星数（最近一个完整 GSV 周期）
 static uint8_t gnssCN0[6]    = {0};  // 各系统最强 CN0/信噪比 dBHz（最近一个周期）
 static uint8_t gnssAccCN0[6] = {0};  // 当前进行中周期内的 CN0 累加器
 static uint8_t gnssAnt       = 0;    // 天线: 0 未知 / 1 OK / 2 开路 / 3 短路
-static char    nmeaLine[100];        // NMEA 整行装配缓冲（最长 82 字符）
+static char    nmeaLine[192];        // 整行装配缓冲：NMEA 最长 82，但 $S3R,INFO 应答 ~150 字符
 static uint8_t nmeaLen       = 0;
 
 static GpsState  gpsState      = GS_DETECTING;
@@ -151,6 +160,9 @@ RTC_NOINIT_ATTR static PwrLogEntry pwrlogBuf[PWRLOG_CAP];
 // ═══════════════════════════════════════════════════════════════════════════
 
 void setup() {
+    // USB-CDC 接收缓冲加大：HWCDC 默认 256B，s3rbridge 透传桥转发 OTA 的 1KB 数据块
+    // 会被截丢（S3R 侧同坑实测坐实，见 s3r/HANDOFF.md）。必须在 begin 之前设。
+    Serial.setRxBufferSize(4096);
     Serial.begin(115200);
     delay(300);   // let USB-serial settle before first print
     Serial.println("\n=== M5Power APRS Tracker ===");

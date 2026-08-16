@@ -381,6 +381,15 @@ static int  flashLogUpload();
 #if !GNSS_TIMESHARE
 // ── config_a.ino 专有 ──
 static void gpsDrainStale();   // 长阻塞操作(发包/补发/开机初始化)后丢弃 RX 缓冲里的旧 NMEA
+
+// ── S3R 协处理器链路（AtomS3R 透传桥/心跳/链路看门狗，见 s3r/HANDOFF.md）──────────
+static const uint32_t S3R_PING_MS        = 60000UL;   // 心跳周期：$S3R,PING（兼 OTA 确认）
+static const uint32_t S3R_LINK_WDT_MS    = 180000UL;  // NMEA 断流超此时长 → 断电重启整链
+static const uint32_t S3R_WDT_OFF_MS     = 2000UL;    // 看门狗断电时长
+static const uint32_t S3R_BRIDGE_IDLE_MS = 60000UL;   // 透传桥无 USB 数据自动退出阈值
+static void s3rBridgeMode();             // USB↔PORT.C 透传桥（给装机后的 S3R 做 UART-OTA）
+static void s3rLinkLine(const char* s);  // 链路上收到的 $S3R 行（PONG/CONFIRMED/INFO…）
+static void s3rLinkTick(uint32_t now);   // 周期心跳 + NMEA 断流看门狗
 #endif
 
 #if GNSS_TIMESHARE
