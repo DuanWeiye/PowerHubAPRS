@@ -15,8 +15,9 @@
   - 真 OTA 经 PowerHub 桥全流程成功：434KB @ 8.9KB/s(UART 115200 上限)，app0→app1，
     PING 确认 pend=0；桥 60s 空闲自动退出恢复正常运行。
   - 心跳 60s 整拍收 `$S3R,PONG`，`[S3R]` 行进 PowerHub 日志。
-- **git 未提交**：`s3r/` 目录 + 主仓 firmware/ 改动都无 commit（提交前照例做隐私扫描，
-  s3r/ 目录应无服务器信息）。
+- **git 已提交（08-16）**：29c29b1（s3r/ 子项目）+ 284924c（firmware/ 三件+校验和门）。
+  隐私扫描通过；nmea_rw_test.c 测试坐标已从家附近换成东京站地标；imulog_*（真实轨迹）、
+  *.bin、test/replay 均已 gitignore——以后新增测试夹具坐标一律用公开地标。
 
 ## 已验证的关键事实（都是实测/文档坐实，不要重新怀疑）
 
