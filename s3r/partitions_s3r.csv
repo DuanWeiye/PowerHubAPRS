@@ -1,0 +1,15 @@
+# partitions_s3r.csv — S3R 自定义分区表（P2 重分区：日志空间 1.5MB → 4.875MB）
+#
+# 编译仍用 PartitionScheme=default_8MB（只影响构建期 app 尺寸上限检查，固件 ~530KB
+# 远小于两种上限）；**实际生效的是本表**——build.sh -f 时经 gen_esp32part.py 转 bin
+# 写入 0x8000，运行时 app/OTA/LittleFS 全按片上分区表定位。
+# app 槽 3.3MB→1.5MB×2（固件用不满），腾出的空间全部给 spiffs(LittleFS)：
+# 双层日志 = 全速率环形(/il/) + 全天摘要环形(/ils/)，见 imulog.ino。
+# 首刷本表后 LittleFS 首次挂载会因布局变化自动格式化（旧日志已拉取过，无损失）。
+# Name,   Type, SubType, Offset,  Size, Flags
+nvs,      data, nvs,     0x9000,  0x5000,
+otadata,  data, ota,     0xe000,  0x2000,
+app0,     app,  ota_0,   0x10000, 0x180000,
+app1,     app,  ota_1,   0x190000,0x180000,
+spiffs,   data, spiffs,  0x310000,0x4E0000,
+coredump, data, coredump,0x7F0000,0x10000,
