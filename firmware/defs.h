@@ -232,6 +232,7 @@ struct LiveFix {
     float    altM = 0, spdKmh = 0, courseDeg = -1, hdop = 25.5f;
     bool     courseValid = false;
     uint8_t  sats        = 0;
+    bool     est         = false;   // S3R 推算点（GGA quality=6）——仅 S3R 旁路模式下有意义
     uint32_t tMs         = 0;       // 上次更新 millis（判新鲜度）
 };
 
@@ -251,7 +252,14 @@ struct __attribute__((packed)) TrackPoint {
     uint8_t  hdop;     // HDOP × 10 (capped 25.5)
     uint16_t bat_mv;
     uint8_t  bat_pct;
-};                     // 20 bytes/point
+    // ── v2（S3R 融合遥测，0822 起）：解决"外场无法实时观测"——每个点带估计器状态 ──
+    uint8_t  nav;      // b0=S3R 估计器在线(旁路自家 KF) b1=推算点(quality 6) b2=本点来自自家 KF
+    uint8_t  sig;      // 位置 1σ 米（S3R 旁路=估计器 σ；自家管线=KF σ），封顶 255
+    uint8_t  still;    // 停留信念 0..100（S3R 旁路时；自家管线恒 0）
+    uint8_t  cn0;      // 全星座最强 CN0 dBHz（GSV）
+    uint8_t  rej;      // 上个 beacon 以来被野点门拒绝的候选数（S3R 旁路=S3R 计数差；自家=自家计数差），封顶 255
+};                     // 25 bytes/point（布局变更须 +1 FL_FMT_VER：flashlog 旧段按新布局读会错位）
+#define FL_FMT_VER 2   // 段日志记录布局版本；flashLogBegin 不匹配即清空旧段（旧布局无法解析）
 
 // Power log entry (RTC slow memory ring; survives reset, lost on full power-off).
 #define PWRLOG_MAGIC 0x50574C33UL    // 'PWL3' — bump to invalidate old layout
@@ -300,6 +308,7 @@ static void     refreshUsbLed();
 
 // ── pwrlog.ino ──
 static void gnssDiagLine(const char* s);
+static uint8_t gnssMaxCn0();           // 全星座最强 CN0（遥测）
 static void pwrlogInit();
 static void pwrlogClear();
 static void pwrlogAppend();
@@ -331,6 +340,12 @@ static void    gnssKfSmooth(double lat, double lon, float hdop, uint32_t nowMs, 
 static void    gnssFeedLiveFix(double lat, double lon, uint32_t nowMs, float altM,
                                 bool haveSpd, float spdKmh, bool haveCourse, float courseDeg,
                                 bool haveHdop, float hdop, bool haveSats, uint8_t sats);  // 野点过滤+平滑→写liveFix，A/B共用入口
+static void    gnssPipelineReset();     // 野点参照+KF 整体重置（S3R 旁路→自家管线切回时调用）
+static float   gnssOwnSigmaM();         // 自家 KF 位置 1σ（米；未起算=0）
+static uint32_t gnssOwnRejects();       // 自家野点门累计拒绝数
+static void    s3rFeedLiveFix(double lat, double lon, uint32_t nowMs, float altM, float spdKmh,
+                              bool haveCourse, float courseDeg, float hdop, uint8_t sats, bool est);
+                                        // S3R 旁路：估计器已改写的 NMEA 直接进 liveFix（单估计器原则）
 
 // ── buttons.ino ──
 static void powerSaveShutdown();
@@ -387,9 +402,26 @@ static const uint32_t S3R_PING_MS        = 60000UL;   // 心跳周期：$S3R,PIN
 static const uint32_t S3R_LINK_WDT_MS    = 180000UL;  // NMEA 断流超此时长 → 断电重启整链
 static const uint32_t S3R_WDT_OFF_MS     = 2000UL;    // 看门狗断电时长
 static const uint32_t S3R_BRIDGE_IDLE_MS = 60000UL;   // 透传桥无 USB 数据自动退出阈值
+static const uint32_t S3R_NAV_HOLD_MS    = 40000UL;   // $PFUSE(1Hz) 超此未见 → 估计器视为离线，回落自家管线。
+                                                      // 须 > 发包阻塞(15-25s)：阻塞期 RX 溢出+gpsDrainStale 会把
+                                                      // 心跳一并丢掉，5s 会让每次 beacon 后都离线/在线翻一次并
+                                                      // 白重置自家 KF（台面注入实测）。S3R 真挂了 NMEA 流也没了，
+                                                      // 40s 内没东西可消费，不损失任何东西；fuse 关则 en=0 即时回落。
 static void s3rBridgeMode();             // USB↔PORT.C 透传桥（给装机后的 S3R 做 UART-OTA）
 static void s3rLinkLine(const char* s);  // 链路上收到的 $S3R 行（PONG/CONFIRMED/INFO…）
 static void s3rLinkTick(uint32_t now);   // 周期心跳 + NMEA 断流看门狗
+// ── S3R 估计器心跳（$PFUSE,2,…）：在线且 en=1 → 旁路自家野点门+KF，直接消费改写后的 NMEA ──
+struct S3rNav {
+    uint32_t tLast   = 0;     // 上次收到 $PFUSE 的 millis（0=从未）
+    bool     en      = false; // S3R 侧 fuse 开关
+    char     mode    = '?';   // P/F/C/N（见 s3r/fuse.ino）
+    float    sigmaM  = 0, still = 0, spdMps = 0, hdopEma = 0, accStd = 0, headRate = 0;
+    uint32_t rej     = 0;     // S3R 累计拒绝数
+    bool     carried = false;
+    uint32_t lines   = 0;     // 收到的 PFUSE 行数（诊断）
+};
+static void s3rFuseLine(const char* s);  // 解析 $PFUSE 行
+static bool s3rNavActive(uint32_t now);  // en=1 且心跳新鲜
 #endif
 
 #if GNSS_TIMESHARE

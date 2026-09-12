@@ -8,7 +8,7 @@
 //   · 磁盘满 → 删最旧段（记录仪保最新）。
 //   · RAM 里只缓存计数（O(1)），开机扫一次盘重建，之后全增量维护，绝不每轮扫盘。
 //
-// 段文件：/t/<8位序号>.s ，每条记录 = 一个 packed TrackPoint(20B)。
+// 段文件：/t/<8位序号>.s ，每条记录 = 一个 packed TrackPoint(25B，v2)；/t/fmt 记布局版本。
 //
 // 配置A/B 共用：B 每个 beacon 都记 + 静止/无定位才 flush；A 仅在实时发包失败(无信号)
 // 时记，网络一恢复(下次发包成功)立刻全部上传——两套都靠这份持久化存储，彻底防断电。
@@ -16,7 +16,7 @@
 #include <LittleFS.h>
 #include <ctype.h>
 
-#define FL_REC ((int)sizeof(TrackPoint))   // 20 字节/点
+#define FL_REC ((int)sizeof(TrackPoint))   // 25 字节/点（v2）
 #define FL_DIR "/t"
 
 static bool     flReady       = false;
@@ -44,6 +44,30 @@ static void flashLogBegin() {
     flReady = LittleFS.begin(true);          // true = 首次/损坏则格式化为 LittleFS
     if (!flReady) { Serial.println("[FL] LittleFS 挂载失败"); return; }
     if (!LittleFS.exists(FL_DIR)) LittleFS.mkdir(FL_DIR);
+
+    // 记录布局版本（TrackPoint 变化时 +1 FL_FMT_VER）：不匹配 → 旧段全部丢弃。
+    // 旧布局的点按新长度读会错位成垃圾坐标，宁可丢掉 OTA 时刻恰好积压的少数点。
+    {
+        int ver = 0;
+        File vf = LittleFS.open(FL_DIR "/fmt", "r");
+        if (vf) { ver = vf.parseInt(); vf.close(); }
+        if (ver != FL_FMT_VER) {
+            int dropped = 0;
+            File dir = LittleFS.open(FL_DIR);
+            if (dir) {
+                char names[64][40]; int nn = 0;
+                for (File f = dir.openNextFile(); f && nn < 64; f = dir.openNextFile()) {
+                    uint32_t seq;
+                    if (flParseSeq(f.name(), &seq)) flSegPath(names[nn++], 40, seq);
+                }
+                dir.close();
+                for (int i = 0; i < nn; i++) if (LittleFS.remove(names[i])) dropped++;
+            }
+            vf = LittleFS.open(FL_DIR "/fmt", "w");
+            if (vf) { vf.print(FL_FMT_VER); vf.close(); }
+            Serial.printf("[FL] 记录布局 v%d → v%d：旧段 %d 个已丢弃\n", ver, FL_FMT_VER, dropped);
+        }
+    }
 
     uint32_t minSeq = 0, maxSeq = 0;
     uint16_t maxSeqPts = 0, fullCount = 0;
@@ -147,7 +171,7 @@ static bool flReqSegment(const char* path, uint16_t* nOut) {
         uint16_t take = (uint16_t)((n - i) < FL_BATCH ? (n - i) : FL_BATCH);
         int pos = 0; body[pos++] = '[';
         for (uint16_t k = 0; k < take; k++) {
-            char one[160];
+            char one[224];                      // v2 点 ~180 字符
             int m = fmtPoint(one, sizeof(one), pts[i + k]);
             if (k) body[pos++] = ',';
             memcpy(body + pos, one, m); pos += m;

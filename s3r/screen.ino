@@ -97,16 +97,17 @@ static void scrRender(LovyanGFX* g) {
     g->setTextDatum(textdatum_t::middle_right);
     g->drawString(line, 124, CY_SIG);
 
-    // ── 行3：锁存/DR 状态 > 速度 > 各星座可见星（G/R/B/E/Q）──
+    // ── 行3：推算/停留状态 > 速度 > 各星座可见星（G/R/B/E/Q）──
     g->setFont(&sfonts::Font2);
     g->setTextColor(TFT_WHITE, TFT_BLACK);
     g->setTextDatum(textdatum_t::middle_center);
-    if (fuseIsLatched()) {
-        g->setTextColor(TFT_CYAN, TFT_BLACK);      // 静止锁存中（IMU 判静止，坐标已锁）
-        snprintf(line, sizeof(line), "LOCK");
-    } else if (fuseIsDr()) {
-        g->setTextColor(TFT_ORANGE, TFT_BLACK);    // 断档 DR 桥接中
-        snprintf(line, sizeof(line), "DR bridge");
+    char fm = fuseModeGet();
+    if (fm == 'C') {
+        g->setTextColor(TFT_ORANGE, TFT_BLACK);    // 断档推算中（诚实界内）
+        snprintf(line, sizeof(line), "COAST s%.0fm", fuseSigmaGet());
+    } else if (fm == 'F' && fuseStillGet() >= 0.8f) {
+        g->setTextColor(TFT_CYAN, TFT_BLACK);      // 停留信念满（ZUPT 收敛中）
+        snprintf(line, sizeof(line), "STILL");
     } else if (gpsState == GS_FIX_GOOD && gps.speed.isValid()) {
         snprintf(line, sizeof(line), "SPD %.1f km/h", gps.speed.kmph());
     } else {

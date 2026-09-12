@@ -163,6 +163,90 @@ int main() {
         printf("      sample DR RMC: %s\n", out);
     }
 
+    // ── 6b. v2 改写 API（fuse.ino v0.3 实际调用路径）：真机语句 → apply/invalidate → 回读 ──
+    {
+        // 有效 GGA（东京站，真实格式）：跟踪点只换坐标，quality/HDOP/星数原样
+        char line[140], work[140], out[160];
+        mkline(line, sizeof(line),
+               "GNGGA,014530.00,3540.87416,N,13946.02750,E,1,12,0.9,25.3,M,39.1,M,,");
+        strcpy(work, line);
+        char* f[NMEA_MAX_FIELDS];
+        int n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        NmeaEdit e;
+        double kfLat = 35.681300, kfLon = 139.767200;      // KF 输出（离原点 ~8m）
+        CHECK(nmeaGgaApply(f, n, kfLat, kfLon, false, 5.0f, 25.3f, &e), "v2 GGA apply (fix)");
+        CHECK(nmeaRebuild(out, sizeof(out), f, n) > 0, "v2 GGA rebuild");
+        out[strcspn(out, "\r\n")] = 0;
+        CHECK(nmeaChecksumOk(out), "v2 GGA checksum");
+        char w2[160]; strcpy(w2, out);
+        char* g[NMEA_MAX_FIELDS];
+        int n2 = nmeaSplit(w2, g, NMEA_MAX_FIELDS);
+        double rl, rn;
+        CHECK(n2 == 15 && nmeaLatLonParse(g[2], g[3], &rl) && fabs(rl - kfLat) < 2e-7
+              && nmeaLatLonParse(g[4], g[5], &rn) && fabs(rn - kfLon) < 2e-7, "v2 GGA coords");
+        CHECK(strcmp(g[1], "014530.00") == 0 && strcmp(g[6], "1") == 0 && strcmp(g[7], "12") == 0
+              && strcmp(g[8], "0.9") == 0 && strcmp(g[9], "25.3") == 0, "v2 GGA other fields kept");
+
+        // 无效 GGA（真机抓的）→ 推算点：quality=6、HDOP/海拔补值
+        strcpy(work, "$GNGGA,104759.80,,,,,0,00,9.6,,,,,,*71");
+        n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        CHECK(nmeaGgaApply(f, n, kfLat, kfLon, true, 5.0f, 25.3f, &e), "v2 GGA apply (est)");
+        nmeaRebuild(out, sizeof(out), f, n); out[strcspn(out, "\r\n")] = 0;
+        strcpy(w2, out); n2 = nmeaSplit(w2, g, NMEA_MAX_FIELDS);
+        CHECK(nmeaChecksumOk(out) && strcmp(g[6], "6") == 0 && strcmp(g[8], "9.6") == 0
+              && strcmp(g[9], "25.3") == 0, "v2 GGA est: q=6, hdop kept(9.6), alt filled");
+
+        // 有效 GGA 但估计器拒绝（野点）→ quality=0，坐标保留
+        mkline(line, sizeof(line),
+               "GNGGA,014530.00,3540.87416,N,13946.02750,E,1,12,0.9,25.3,M,39.1,M,,");
+        strcpy(work, line); n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        CHECK(nmeaGgaInvalidate(f, n, &e), "v2 GGA invalidate");
+        nmeaRebuild(out, sizeof(out), f, n); out[strcspn(out, "\r\n")] = 0;
+        strcpy(w2, out); n2 = nmeaSplit(w2, g, NMEA_MAX_FIELDS);
+        CHECK(nmeaChecksumOk(out) && strcmp(g[6], "0") == 0 && strcmp(g[2], "3540.87416") == 0,
+              "v2 GGA invalidated: q=0 coords kept");
+
+        // 有效 RMC → 跟踪点：status A、坐标/速度/航向换估计、模式保持 A
+        mkline(line, sizeof(line),
+               "GNRMC,014530.00,A,3540.87416,N,13946.02750,E,2.72,123.4,220826,,,A,V");
+        strcpy(work, line); n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        CHECK(nmeaRmcApply(f, n, kfLat, kfLon, 15.0f, 271.5f, true, false, &e), "v2 RMC apply (fix)");
+        nmeaRebuild(out, sizeof(out), f, n); out[strcspn(out, "\r\n")] = 0;
+        strcpy(w2, out); n2 = nmeaSplit(w2, g, NMEA_MAX_FIELDS);
+        CHECK(nmeaChecksumOk(out) && n2 == 14 && strcmp(g[2], "A") == 0 && strcmp(g[12], "A") == 0,
+              "v2 RMC fix: status A, mode kept A");
+        CHECK(nmeaLatLonParse(g[3], g[4], &rl) && fabs(rl - kfLat) < 2e-7
+              && strcmp(g[7], "29.16") == 0 && strcmp(g[8], "271.5") == 0 && strcmp(g[9], "220826") == 0,
+              "v2 RMC fix: coords/15m/s=29.16kn/course/date");
+
+        // 无效 RMC（真机）→ 推算点：A + E，航向未知留空
+        strcpy(work, "$GNRMC,104759.80,V,,,,,,,220826,,,N,V*13");
+        n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        CHECK(nmeaRmcApply(f, n, kfLat, kfLon, 0.3f, 0, false, true, &e), "v2 RMC apply (est)");
+        nmeaRebuild(out, sizeof(out), f, n); out[strcspn(out, "\r\n")] = 0;
+        strcpy(w2, out); n2 = nmeaSplit(w2, g, NMEA_MAX_FIELDS);
+        CHECK(nmeaChecksumOk(out) && strcmp(g[2], "A") == 0 && strcmp(g[12], "E") == 0
+              && g[8][0] == 0 && strcmp(g[7], "0.58") == 0, "v2 RMC est: A/E, course empty");
+        printf("      sample v2 est RMC: %s\n", out);
+
+        // 有效 RMC 被拒 → V/N
+        mkline(line, sizeof(line),
+               "GNRMC,014530.00,A,3540.87416,N,13946.02750,E,2.72,123.4,220826,,,A,V");
+        strcpy(work, line); n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        CHECK(nmeaRmcInvalidate(f, n, &e), "v2 RMC invalidate");
+        nmeaRebuild(out, sizeof(out), f, n); out[strcspn(out, "\r\n")] = 0;
+        strcpy(w2, out); n2 = nmeaSplit(w2, g, NMEA_MAX_FIELDS);
+        CHECK(nmeaChecksumOk(out) && strcmp(g[2], "V") == 0 && strcmp(g[12], "N") == 0,
+              "v2 RMC invalidated: V/N");
+        // 西/南半球坐标也走一遍（改写格式化的半球字符）
+        strcpy(work, line); n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        nmeaRmcApply(f, n, -33.8688, -70.6693, 1.0f, 0, false, false, &e);   // 圣地亚哥
+        nmeaRebuild(out, sizeof(out), f, n); out[strcspn(out, "\r\n")] = 0;
+        strcpy(w2, out); n2 = nmeaSplit(w2, g, NMEA_MAX_FIELDS);
+        CHECK(strcmp(g[4], "S") == 0 && strcmp(g[6], "W") == 0
+              && nmeaLatLonParse(g[3], g[4], &rl) && fabs(rl + 33.8688) < 2e-7, "v2 RMC S/W hemisphere");
+    }
+
     // ── 7. 类型判断 ────────────────────────────────────────────────────────────
     CHECK(nmeaIsType("$GNGGA", "GGA") && nmeaIsType("$GPRMC", "RMC")
           && !nmeaIsType("$GNGSV", "GGA") && !nmeaIsType("$PFUSE", "USE") == false,

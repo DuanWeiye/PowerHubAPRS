@@ -1,138 +1,93 @@
-// fuse.ino — 融合 v1：GPS→链路整行泵 + 按需改写 NMEA（PowerHub 零改动）
+// fuse.ino — 融合 v2：GPS→链路整行泵 + nav_core 估计器按需改写 GGA/RMC（PowerHub 可零改动）
 //
-// 三个机制（全部只在"证据充分"时出手，其余场合逐字节透明）：
-//   1) 静止锁存：IMU 判静止(≥3s)后，把 GGA/RMC 坐标锁到最近 3s 定位的中位数、速度置 0。
-//      消灭停留时的 GPS 漂移云（多径 wander 正是在治的头号可见伪影）。
-//   2) GNSS 逃生门：锁存期间原始定位持续(8s)远离锁点(>35m,HDOP<4) → 强制解锁。
-//      IMU 误判（电梯/扶梯/平稳起步的电车）永远不可能把轨迹锁死——GNSS 说了算。
-//   3) 短断档 DR 桥接：移动中丢定位 ≤15s/60m，用"最后好定位的速度 + 陀螺航向角速率"
-//      续写坐标；GGA quality=6（NMEA 标准"估算/DR"）诚实标注，超限即停、如实丢定位。
-// 改写只对校验和合法的行做；不认识/不完整/坏行一律原样转发（透传兜底）。
-// 解析/重建核心在 nmea_rw.h（纯 C，主机单测过再上机）。
+// v1 的静止锁存/DR/逃生门三个开关已整体删除（0808 外场证伪，见 HANDOFF）。v2 只有一个
+// 估计器（nav_core.h：2D 匀速 KF + 连续停留信念 + 诚实 coast），行为全部由它的协方差机制
+// 连续产生；本文件只负责"喂它、把它的输出写回 NMEA"。
+//
+// 每拍语句序（ATGM336H 实测）：RMC → VTG → GGA。估计器由 GGA 驱动（它带 HDOP，和回放
+// 调参时的输入语义一致），所以 RMC 先暂存，GGA 算完后按同一份输出先放改写后的 RMC、再放
+// GGA——同拍两句坐标/速度严格一致。GGA 缺失超时则把暂存的 RMC 原样放行（透传兜底）。
+//
+// 输出规则（诚实优先）：
+//   估计器有点：GGA/RMC 坐标换成估计；推算点 GGA quality=6 / RMC 模式 E。
+//   估计器无点：原句有定位（被野点门拒）→ GGA quality=0 / RMC status=V（不让下游采信）；
+//               原句本就无定位 → 原样转发。
+//   fuse 关 / 坏行 / 非 GGA·RMC → 逐字节透明（透传语义兜底）。
 #include "defs.h"
+#include "nav_core.h"
 
 // ── 开关（NVS 持久，console `fuse on/off` / 链路 $S3R,FUSE）──
 static bool     fuseEn      = true;
+static NavCore  nav;
 
-// ── 定位历史环（锁点取分量中位数：单个多径野点当不了锁点）──
-struct FixHist { double lat, lon; float hdop; uint32_t t; };
-static FixHist  fh[FUSE_HIST_N];
-static int      fhCount     = 0;
-static int      fhHead      = 0;
-
-// ── 静止锁存 ──
-static bool     latched     = false;
-static double   latchLat = 0, latchLon = 0;
-static uint32_t tLatch      = 0;
-static uint32_t tEscSince   = 0;     // 逃生门计时（0=未在计）
-
-// ── 最后一个"好定位"（DR 起点）+ 最近 RMC 速度/航向 ──
-static bool     lgValid     = false;
-static double   lgLat = 0, lgLon = 0;
-static float    lgSpdMps = 0, lgCrsDeg = 0, lgAltM = 0;
-static uint32_t lgT         = 0;
-static float    rawSpdMps   = 0;     // 最近有效 RMC 的速度/航向（喂 lastGood/GNSS 日志）
+// ── 本拍状态（GGA 驱动）──
+static NavOut   epochOut;              // 本拍估计器输出（emit=false 表示无点）
+static float    rawSpdMps   = 0;       // 本拍 RMC 原始速度/航向（喂估计器首拍过渡 + 原始日志）
 static float    rawCrsDeg   = -1;
+static float    lastAltM    = 0;       // 最近有效 GGA 海拔（推算点补字段）
+static char     fuseMode    = 'P';     // P=透传(关) F=跟踪 C=推算 N=本拍无点
+static uint32_t navRej      = 0;       // 候选被野点门拒绝计数（遥测）
+static uint32_t tStillSince = 0;       // still ≥ zuptOn 的起始（imulog 省流判据；0=未满足）
 
-// ── DR 桥接 ──
-static bool     drOn        = false;
-static double   drLat = 0, drLon = 0;
-static float    drSpdMps = 0, drCrsDeg = 0, drDistM = 0;
-static uint32_t tDrStart = 0, tDrLast = 0;
+// ── RMC 暂存（RMC 先于 GGA 到达）──
+static char     heldRmc[128];
+static bool     rmcHeld     = false;
+static bool     heldRmcValid= false;   // 暂存的 RMC 自身 status=A
+static uint32_t tRmcHeld    = 0;
+
+// ── IMU 特征：最近 4 块(1s)滑动最大——与摘要层 FEAT.accStdMax / 回放 feat=device 同语义 ──
+static float    blkStd[4]   = {0};
+static uint8_t  blkIdx      = 0;
 
 // ── 行泵/诊断 ──
 static char     flBuf[128];
 static uint8_t  flLen       = 0;
 static bool     flOverflow  = false;
 static uint32_t tPfuse      = 0;
-static uint32_t tFuseLogPt  = 0;     // ILOG_FUSE 1Hz 节流
+static uint32_t tFuseLogPt  = 0;       // ILOG_FUSE 1Hz 节流
+static uint32_t tInjectUntil= 0;       // 台面注入窗：此前收到过 $S3R,NMEA → 真 GPS 的 GGA/RMC 暂不进估计器
 
-static void fuseInit() {
-    // 默认 OFF：v1 已被 0808 外场证伪（误锁存劣化轨迹），P2 期间纯透传采数据，
-    // v2(nav_core) 在 P3 替换本文件的三开关逻辑。NVS 全擦后也保持安全默认。
-    fuseEn = prefs.getUChar("fuse", 0) != 0;
-    Serial.printf("[FUS] fusion %s (NVS)\n", fuseEn ? "ON" : "OFF");
+static void fuseNavRestart() {
+    NavParams prm;
+    navParamsDefault(&prm);            // P2 定版参数（0808/0816/0822 三份数据）
+    navInit(&nav, &prm);
+    epochOut.emit = false;
+    fuseMode = fuseEn ? 'N' : 'P';
+    tStillSince = 0;
 }
 
-static bool fuseEnabledGet() { return fuseEn; }
-static bool fuseIsLatched()  { return latched; }
-static bool fuseIsDr()       { return drOn; }
+static void fuseInit() {
+    // 默认 ON：v2 已在三份外场数据上回放验证 ≥ 基线；NVS 里有值以其为准（s3rfuse on/off）
+    fuseEn = prefs.getUChar("fuse", 1) != 0;
+    fuseNavRestart();
+    Serial.printf("[FUS] nav v2 %s (NVS)\n", fuseEn ? "ON" : "OFF");
+}
+
+static bool  fuseEnabledGet()  { return fuseEn; }
+static char  fuseModeGet()     { return fuseMode; }
+static float fuseStillGet()    { return nav.have ? nav.still : 0.0f; }
+static float fuseSigmaGet()    { return navSigmaM(&nav); }
+static bool  fuseStillLatched(){ return tStillSince != 0; }
+static uint32_t fuseStillSince(){ return tStillSince; }
 
 static void fuseSetEnabled(bool on) {
     fuseEn = on;
     prefs.putUChar("fuse", on ? 1 : 0);
-    if (!on) {                       // 关掉即刻放开一切干预
-        if (latched) { latched = false; imulogEvent(EV_LATCH_OFF, 0); }
-        if (drOn)    { drOn = false;    imulogEvent(EV_DR_ABORT, 0); }
-    }
-    Serial.printf("[FUS] fusion %s\n", on ? "ON" : "OFF");
+    fuseNavRestart();                  // 开关切换都从干净状态起算（关=放开一切干预）
+    Serial.printf("[FUS] nav v2 %s\n", on ? "ON" : "OFF");
 }
 
-// ── 小工具 ──────────────────────────────────────────────────────────────────
-
-// 等矩形近似距离（米）：本用途全在 <100m 尺度，误差可忽略
-static float fuseDistM(double lat1, double lon1, double lat2, double lon2) {
-    float dN = (float)((lat2 - lat1) * 111320.0);
-    float dE = (float)((lon2 - lon1) * 111320.0 * cos(lat1 * M_PI / 180.0));
-    return sqrtf(dN * dN + dE * dE);
-}
-
-static double fuseMedian(double* v, int n) {     // 插入排序取中位（n≤15）
-    for (int i = 1; i < n; i++) {
-        double x = v[i]; int j = i - 1;
-        while (j >= 0 && v[j] > x) { v[j + 1] = v[j]; j--; }
-        v[j + 1] = x;
-    }
-    return v[n / 2];
-}
-
-static void fuseHistPush(double lat, double lon, float hdop, uint32_t t) {
-    fh[fhHead] = { lat, lon, hdop, t };
-    fhHead = (fhHead + 1) % FUSE_HIST_N;
-    if (fhCount < FUSE_HIST_N) fhCount++;
-}
-
-// 用新鲜历史点的分量中位数定锁点；不足返回 false
-static bool fuseComputeLatch(uint32_t now, double* olat, double* olon) {
-    double la[FUSE_HIST_N], lo[FUSE_HIST_N];
-    int n = 0;
-    for (int i = 0; i < fhCount; i++) {
-        const FixHist& e = fh[i];
-        if (now - e.t <= FUSE_HIST_FRESH_MS) { la[n] = e.lat; lo[n] = e.lon; n++; }
-    }
-    if (n < FUSE_HIST_MIN) return false;
-    *olat = fuseMedian(la, n);
-    *olon = fuseMedian(lo, n);
-    return true;
-}
-
-static void fuseLatchRelease(uint8_t evt) {
-    if (!latched) return;
-    latched = false;
-    tEscSince = 0;
-    imulogEvent(evt, 0);
-    Serial.printf("[FUS] latch released (%s)\n",
-                  evt == EV_LATCH_ESC ? "GNSS escape" : "motion");
-}
-
-// DR 推进一步（dt 秒）：航向按陀螺角速率转动，速度缓慢衰减
-static void fuseDrPropagate(uint32_t now) {
-    float dt = (now - tDrLast) / 1000.0f;
-    if (dt <= 0) return;
-    tDrLast = now;
-    drCrsDeg += imuHeadingRateDps() * dt;
-    while (drCrsDeg >= 360.0f) drCrsDeg -= 360.0f;
-    while (drCrsDeg < 0.0f)    drCrsDeg += 360.0f;
-    drSpdMps *= (1.0f - FUSE_DR_SPD_DECAY * dt);
-    float d = drSpdMps * dt;
-    drDistM += d;
-    double cr = drCrsDeg * M_PI / 180.0;
-    drLat += (double)(d * cos(cr)) / 111320.0;
-    drLon += (double)(d * sin(cr)) / (111320.0 * cos(drLat * M_PI / 180.0));
+// imu.ino 每个 0.25s 统计块结束时调用：滑动 1s 最大 accStd + 当前航向角速率 → 估计器
+static void fuseImuBlock(float accStd, float headRateDps, uint32_t now) {
+    blkStd[blkIdx] = accStd;
+    blkIdx = (blkIdx + 1) & 3;
+    float mx = blkStd[0];
+    for (int i = 1; i < 4; i++) if (blkStd[i] > mx) mx = blkStd[i];
+    if (fuseEn) navImu(&nav, now, mx, headRateDps);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// GGA / RMC 处理（解析→记录→状态机→按需改写→转发）
+// 转发/暂存
 // ═══════════════════════════════════════════════════════════════════════════
 
 static void fuseForwardRaw(const char* line) {
@@ -140,116 +95,33 @@ static void fuseForwardRaw(const char* line) {
     linkSerial.print("\r\n");
 }
 
-static void fuseHandleGGA(const char* line, uint32_t now) {
-    char work[128], out[140];
-    strlcpy(work, line, sizeof(work));
-    char* f[NMEA_MAX_FIELDS];
-    int n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
-    if (n < 10) { fuseForwardRaw(line); return; }
-
-    int    qual  = atoi(f[6]);
-    double lat = 0, lon = 0;
-    bool   valid = qual >= 1 && nmeaLatLonParse(f[2], f[3], &lat)
-                             && nmeaLatLonParse(f[4], f[5], &lon);
-    float  hdop  = f[8][0] ? atof(f[8]) : 25.5f;
-    uint8_t sats = (uint8_t)atoi(f[7]);
-    float  alt   = f[9][0] ? atof(f[9]) : 0.0f;
-
-    // 原始 GNSS 落盘（速度/航向取最近有效 RMC 的）
-    imulogGnss(now, lat, lon, alt, rawSpdMps, rawCrsDeg < 0 ? 0 : rawCrsDeg,
-               hdop, sats, valid);
-
-    // ── 簿记（与开关无关）──
-    if (valid) {
-        if (hdop <= FUSE_HIST_HDOP_MAX) fuseHistPush(lat, lon, hdop, now);
-        if (hdop <= FUSE_DR_HDOP_OK) {
-            lgLat = lat; lgLon = lon; lgAltM = alt;
-            lgSpdMps = rawSpdMps; lgCrsDeg = (rawCrsDeg < 0 ? 0 : rawCrsDeg);
-            lgT = now; lgValid = true;
-        }
-        if (drOn) {                          // 定位回归 → 结束 DR，记桥接误差
-            drOn = false;
-            float err = fuseDistM(drLat, drLon, lat, lon);
-            imulogEvent(EV_DR_OFF, err);
-            Serial.printf("[FUS] DR end: bridged %.0fm, err vs fix %.0fm\n", drDistM, err);
-        }
+// 暂存的 RMC 按本拍输出放行：有点→改写；原句有效但本拍无点→作废；其余原样
+static void fuseReleaseHeldRmc(bool useEpoch) {
+    if (!rmcHeld) return;
+    rmcHeld = false;
+    if (useEpoch) {
+        char work[128], out[140];
+        strlcpy(work, heldRmc, sizeof(work));
+        char* f[NMEA_MAX_FIELDS];
+        int n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+        NmeaEdit e;
+        bool ok = false;
+        if (epochOut.emit)
+            ok = nmeaRmcApply(f, n, epochOut.lat, epochOut.lon, epochOut.spdMps,
+                              epochOut.crsDeg, epochOut.crsValid, epochOut.est, &e);
+        else if (heldRmcValid)
+            ok = nmeaRmcInvalidate(f, n, &e);
+        else { fuseForwardRaw(heldRmc); return; }
+        if (ok && nmeaRebuild(out, sizeof(out), f, n) > 0) { linkSerial.print(out); return; }
     }
-
-    // ── 锁存状态机 ──
-    if (latched && !imuIsStationary()) fuseLatchRelease(EV_LATCH_OFF);
-    if (latched && valid && hdop <= FUSE_ESC_HDOP) {
-        if (fuseDistM(latchLat, latchLon, lat, lon) > FUSE_ESC_DIST_M) {
-            if (!tEscSince) tEscSince = now;
-            else if (now - tEscSince >= FUSE_ESC_MS) fuseLatchRelease(EV_LATCH_ESC);
-        } else tEscSince = 0;
-    }
-    if (!latched && fuseEn && imuOk() && imuIsStationary()
-            && now - imuStationarySince() >= FUSE_LATCH_MIN_STAT_MS
-            && fuseComputeLatch(now, &latchLat, &latchLon)) {
-        latched = true;
-        tLatch = now;
-        tEscSince = 0;
-        imulogEvent(EV_LATCH_ON, 0);
-        Serial.printf("[FUS] latch ON @%.6f,%.6f\n", latchLat, latchLon);
-    }
-
-    // ── DR 进入（本句无定位时）──
-    if (!valid && !drOn && fuseEn && imuOk() && imuBiasKnown() && !imuIsStationary()
-            && lgValid && now - lgT <= FUSE_DR_START_MS && lgSpdMps >= FUSE_DR_MIN_SPD) {
-        drOn = true;
-        drLat = lgLat; drLon = lgLon;
-        drSpdMps = lgSpdMps; drCrsDeg = lgCrsDeg; drDistM = 0;
-        tDrStart = now; tDrLast = lgT;           // 从最后好定位时刻起推
-        imulogEvent(EV_DR_ON, lgSpdMps);
-        Serial.printf("[FUS] DR start @%.1f m/s crs %.0f\n", lgSpdMps, lgCrsDeg);
-    }
-    // DR 超限/静止 → 停（诚实把无定位交回去）
-    if (drOn && (now - tDrStart > FUSE_DR_MAX_MS || drDistM > FUSE_DR_MAX_DIST_M
-                 || imuIsStationary())) {
-        drOn = false;
-        imulogEvent(EV_DR_ABORT, drDistM);
-        Serial.printf("[FUS] DR abort (%.0fm bridged)\n", drDistM);
-    }
-
-    // ── 输出 ──
-    char dmLat[NMEA_NUM_BUF], dmLon[NMEA_NUM_BUF], hemiLat[2] = {0}, hemiLon[2] = {0};
-    char hdopBuf[NMEA_NUM_BUF], altBuf[NMEA_NUM_BUF], qualBuf[2];
-    if (latched) {
-        // 锁存输出。定位还在：只替换坐标（quality/hdop/sats 保持原样，诚实）。
-        // 定位丢了（高架下/楼影里静止等待）：IMU 明确知道人没动 → 用锁点续发，
-        // quality=6 标注估算。无 GNSS 时逃生门失效，但静止检测一退出立即放行，风险有界。
-        nmeaLatLonFmt(latchLat, false, dmLat, sizeof(dmLat), &hemiLat[0]);
-        nmeaLatLonFmt(latchLon, true,  dmLon, sizeof(dmLon), &hemiLon[0]);
-        f[2] = dmLat; f[3] = hemiLat; f[4] = dmLon; f[5] = hemiLon;
-        if (!valid) {
-            qualBuf[0] = '6'; qualBuf[1] = 0;
-            f[6] = qualBuf;
-            if (!f[8][0]) { strcpy(hdopBuf, "5.0"); f[8] = hdopBuf; }
-            if (!f[9][0]) { snprintf(altBuf, sizeof(altBuf), "%.1f", lgAltM); f[9] = altBuf; }
-        }
-        if (nmeaRebuild(out, sizeof(out), f, n) > 0) linkSerial.print(out);
-        else fuseForwardRaw(line);
-        if (now - tFuseLogPt >= 1000) { tFuseLogPt = now; imulogFuse(now, latchLat, latchLon, 1); }
-        return;
-    }
-    if (drOn && !valid) {
-        fuseDrPropagate(now);
-        nmeaLatLonFmt(drLat, false, dmLat, sizeof(dmLat), &hemiLat[0]);
-        nmeaLatLonFmt(drLon, true,  dmLon, sizeof(dmLon), &hemiLon[0]);
-        qualBuf[0] = '6'; qualBuf[1] = 0;        // NMEA 标准：6 = estimated/DR
-        f[2] = dmLat; f[3] = hemiLat; f[4] = dmLon; f[5] = hemiLon; f[6] = qualBuf;
-        if (!f[8][0]) { strcpy(hdopBuf, "5.0"); f[8] = hdopBuf; }
-        if (!f[9][0]) { snprintf(altBuf, sizeof(altBuf), "%.1f", lgAltM); f[9] = altBuf; }
-        if (nmeaRebuild(out, sizeof(out), f, n) > 0) linkSerial.print(out);
-        else fuseForwardRaw(line);
-        if (now - tFuseLogPt >= 1000) { tFuseLogPt = now; imulogFuse(now, drLat, drLon, 2); }
-        return;
-    }
-    fuseForwardRaw(line);
+    fuseForwardRaw(heldRmc);
 }
 
+// ═══════════════════════════════════════════════════════════════════════════
+// RMC：记原始速度/航向 → 暂存到 GGA 算完
+// ═══════════════════════════════════════════════════════════════════════════
 static void fuseHandleRMC(const char* line, uint32_t now) {
-    char work[128], out[140];
+    char work[128];
     strlcpy(work, line, sizeof(work));
     char* f[NMEA_MAX_FIELDS];
     int n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
@@ -257,61 +129,105 @@ static void fuseHandleRMC(const char* line, uint32_t now) {
 
     bool   valid = (f[2][0] == 'A');
     double lat = 0, lon = 0;
-    if (valid) valid = nmeaLatLonParse(f[3], f[4], &lat)
-                    && nmeaLatLonParse(f[5], f[6], &lon);
+    if (valid) valid = nmeaLatLonParse(f[3], f[4], &lat) && nmeaLatLonParse(f[5], f[6], &lon);
     if (valid) {
-        if (f[7][0]) rawSpdMps = atof(f[7]) * 0.514444f;   // 节 → m/s
-        if (f[8][0]) rawCrsDeg = atof(f[8]);
-    }
+        rawSpdMps = f[7][0] ? atof(f[7]) * 0.514444f : 0.0f;   // 节 → m/s
+        rawCrsDeg = f[8][0] ? atof(f[8]) : -1.0f;
+    } else { rawSpdMps = 0; rawCrsDeg = -1; }
 
-    char dmLat[NMEA_NUM_BUF], dmLon[NMEA_NUM_BUF], hemiLat[2] = {0}, hemiLon[2] = {0};
-    char spdBuf[NMEA_NUM_BUF], crsBuf[NMEA_NUM_BUF], stBuf[2];
-    if (latched) {
-        // 同 GGA：定位在丢失中也用锁点续发（status=A + mode=E 标注估算）
-        nmeaLatLonFmt(latchLat, false, dmLat, sizeof(dmLat), &hemiLat[0]);
-        nmeaLatLonFmt(latchLon, true,  dmLon, sizeof(dmLon), &hemiLon[0]);
-        strcpy(spdBuf, "0.00");
-        f[3] = dmLat; f[4] = hemiLat; f[5] = dmLon; f[6] = hemiLon; f[7] = spdBuf;
-        if (!valid) {
-            stBuf[0] = 'A'; stBuf[1] = 0;
-            f[2] = stBuf;
-            if (n >= 13) f[12] = (char*)"E";
-        }
-        if (nmeaRebuild(out, sizeof(out), f, n) > 0) { linkSerial.print(out); return; }
-        fuseForwardRaw(line);
-        return;
+    if (!fuseEn) { fuseForwardRaw(line); return; }
+    fuseReleaseHeldRmc(false);         // 上一拍 GGA 没来 → 先把旧的原样放掉
+    strlcpy(heldRmc, line, sizeof(heldRmc));
+    heldRmcValid = valid;
+    rmcHeld = true;
+    tRmcHeld = now;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════
+// GGA：原始日志 → 估计器一步 → 放 RMC → 放 GGA
+// ═══════════════════════════════════════════════════════════════════════════
+static void fuseHandleGGA(const char* line, uint32_t now) {
+    char work[128], out[140];
+    strlcpy(work, line, sizeof(work));
+    char* f[NMEA_MAX_FIELDS];
+    int n = nmeaSplit(work, f, NMEA_MAX_FIELDS);
+    if (n < 10) { fuseReleaseHeldRmc(false); fuseForwardRaw(line); return; }
+
+    int    qual  = atoi(f[6]);
+    double lat = 0, lon = 0;
+    bool   valid = qual >= 1 && nmeaLatLonParse(f[2], f[3], &lat)
+                             && nmeaLatLonParse(f[4], f[5], &lon)
+                             && !(lat == 0.0 && lon == 0.0);   // 空字段解析成 0,0 ≠ 定位
+
+    float  hdop  = f[8][0] ? atof(f[8]) : 25.5f;
+    uint8_t sats = (uint8_t)atoi(f[7]);
+    float  alt   = f[9][0] ? atof(f[9]) : 0.0f;
+
+    // 原始 GNSS 落盘（与开关无关；速度/航向来自本拍 RMC）
+    imulogGnss(now, lat, lon, alt, rawSpdMps, rawCrsDeg < 0 ? 0 : rawCrsDeg, hdop, sats, valid);
+    if (valid) lastAltM = alt;
+
+    if (!fuseEn) { fuseReleaseHeldRmc(false); fuseForwardRaw(line); return; }
+
+    // ── 估计器一步 ──
+    NavOut o;
+    bool got;
+    if (valid) {
+        got = navGnss(&nav, now, lat, lon, hdop, rawSpdMps, rawCrsDeg, &o);
+        if (!got) { navRej++; got = navCoast(&nav, now, &o); }   // 野点拍 → 推算
+    } else {
+        got = navCoast(&nav, now, &o);
     }
-    if (drOn && !valid) {
-        fuseDrPropagate(now);
-        nmeaLatLonFmt(drLat, false, dmLat, sizeof(dmLat), &hemiLat[0]);
-        nmeaLatLonFmt(drLon, true,  dmLon, sizeof(dmLon), &hemiLon[0]);
-        stBuf[0] = 'A'; stBuf[1] = 0;
-        snprintf(spdBuf, sizeof(spdBuf), "%.2f", drSpdMps / 0.514444f);
-        snprintf(crsBuf, sizeof(crsBuf), "%.1f", drCrsDeg);
-        f[2] = stBuf; f[3] = dmLat; f[4] = hemiLat; f[5] = dmLon; f[6] = hemiLon;
-        f[7] = spdBuf; f[8] = crsBuf;
-        if (n >= 13) f[12] = (char*)"E";         // NMEA 4.x 模式指示：E = estimated
-        if (nmeaRebuild(out, sizeof(out), f, n) > 0) { linkSerial.print(out); return; }
-        fuseForwardRaw(line);
-        return;
+    if (got && o.emit) epochOut = o; else epochOut.emit = false;
+    fuseMode = epochOut.emit ? (epochOut.est ? 'C' : 'F') : 'N';
+    if (nav.have && nav.still >= nav.prm.zuptOn) { if (!tStillSince) tStillSince = now; }
+    else tStillSince = 0;
+
+    // ── 输出：先 RMC（同拍），再 GGA ──
+    fuseReleaseHeldRmc(true);
+    NmeaEdit e;
+    bool ok = false;
+    if (epochOut.emit)
+        ok = nmeaGgaApply(f, n, epochOut.lat, epochOut.lon, epochOut.est,
+                          NAV_EST_HDOP_FILL, lastAltM, &e);
+    else if (valid)
+        ok = nmeaGgaInvalidate(f, n, &e);
+    else { fuseForwardRaw(line); return; }
+    if (ok && nmeaRebuild(out, sizeof(out), f, n) > 0) linkSerial.print(out);
+    else fuseForwardRaw(line);
+
+    if (epochOut.emit && now - tFuseLogPt >= 1000) {
+        tFuseLogPt = now;
+        imulogFuse(now, epochOut.lat, epochOut.lon, epochOut.est ? 2 : 1);
     }
-    fuseForwardRaw(line);
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 行泵 + 周期 tick
 // ═══════════════════════════════════════════════════════════════════════════
 
-static void fuseProcessLine(const char* line, uint32_t now) {
-    // 只碰校验和合法的 GGA/RMC；其余（GSV/GSA/TXT/坏行/半行）原样转发
+static void fuseProcessLineEx(const char* line, uint32_t now, bool injected) {
+    // 只碰校验和合法的 GGA/RMC；其余（GSV/GSA/VTG/TXT/坏行/半行）原样转发
     if (line[0] == '$' && nmeaChecksumOk(line)) {
-        if (nmeaIsType(line, "GGA")) { fuseHandleGGA(line, now); return; }
-        if (nmeaIsType(line, "RMC")) { fuseHandleRMC(line, now); return; }
+        bool rmc = nmeaIsType(line, "RMC"), gga = nmeaIsType(line, "GGA");
+        // 注入窗内真 GPS 的定位句整条丢弃（屋里无定位的真句每拍都会触发 coast，搅混台面测试）；
+        // 窗口 3s 无注入自动关闭，外场永远不会进入。
+        if ((rmc || gga) && !injected && tInjectUntil && (int32_t)(tInjectUntil - now) > 0) return;
+        if (rmc) { fuseHandleRMC(line, now); return; }
+        if (gga) { fuseHandleGGA(line, now); return; }
     }
     fuseForwardRaw(line);
 }
+static void fuseProcessLine(const char* line, uint32_t now) { fuseProcessLineEx(line, now, false); }
 
-// GPS→link 的整行泵（替代逐字节直转发；一行延迟 ~7ms@115200，PowerHub 无感）
+// 台面注入（ota.ino $S3R,NMEA,…）：整句当 GPS 输出喂估计器，并开 3s 注入窗
+static void fuseInjectLine(const char* line) {
+    uint32_t now = millis();
+    tInjectUntil = now + 3000;
+    fuseProcessLineEx(line, now, true);
+}
+
+// GPS→link 的整行泵（一行延迟 ~7ms@115200；RMC 另加暂存到 GGA ≈ 2 句 ~15ms，PowerHub 无感）
 static void fusePumpChar(char c) {
     if (flOverflow) {                            // 超长行：raw 直通直到行尾
         linkSerial.write((uint8_t)c);
@@ -337,28 +253,35 @@ static void fusePumpChar(char c) {
     }
 }
 
-// 1Hz：$PFUSE 诊断句 + 与句流无关的锁存释放兜底
+// 1Hz：$PFUSE 心跳/诊断句 + 暂存 RMC 超时兜底
 static void fuseTick(uint32_t now) {
-    if (latched && !imuIsStationary()) fuseLatchRelease(EV_LATCH_OFF);
+    if (rmcHeld && now - tRmcHeld > NAV_RMC_HOLD_MS) fuseReleaseHeldRmc(false);   // GGA 缺失
     if (now - tPfuse < FUSE_PFUSE_MS) return;
     tPfuse = now;
-    char body[96], out[110];
-    char mode = latched ? 'L' : (drOn ? 'D' : 'P');
-    snprintf(body, sizeof(body), "PFUSE,1,%d,%d,%c,%lu,%.0f,%.2f,%.2f,%.2f",
-             fuseEn ? 1 : 0, imuIsStationary() ? 1 : 0, mode,
-             latched ? (unsigned long)((now - tLatch) / 1000) : 0UL,
-             drOn ? drDistM : 0.0f, imuHeadingRateDps(), imuAccStd(), imuGyroMag());
+    // $PFUSE,2,<en>,<mode>,<σm>,<still>,<spd m/s>,<hdopEma>,<rej>,<carried>,<accStd1s>,<headRate>
+    // PowerHub 据 en+新鲜度决定是否旁路自家野点门/KF（单估计器原则），其余字段为遥测。
+    float mx = blkStd[0];
+    for (int i = 1; i < 4; i++) if (blkStd[i] > mx) mx = blkStd[i];
+    float spd = nav.have ? sqrtf((float)(nav.kx.v * nav.kx.v + nav.ky.v * nav.ky.v)) : 0.0f;
+    char body[110], out[124];
+    snprintf(body, sizeof(body), "PFUSE,2,%d,%c,%.1f,%.2f,%.1f,%.1f,%lu,%d,%.2f,%.1f",
+             fuseEn ? 1 : 0, fuseMode, navSigmaM(&nav), fuseStillGet(), spd,
+             nav.hdopEma, (unsigned long)navRej, navCarried(&nav, now) ? 1 : 0,
+             mx, nav.headRateDps);
     snprintf(out, sizeof(out), "$%s*%02X\r\n", body, nmeaChecksum(body));
     linkSerial.print(out);
 }
 
 // console `fuse`
 static void fusePrintStatus() {
-    Serial.printf("[FUS] en=%d mode=%c latched=%d(%lus) dr=%d(%.0fm) hist=%d lg=%d(%.1fs)\n",
-                  fuseEn, latched ? 'L' : (drOn ? 'D' : 'P'),
-                  latched, latched ? (unsigned long)((millis() - tLatch) / 1000) : 0UL,
-                  drOn, drDistM, fhCount, lgValid,
-                  lgValid ? (millis() - lgT) / 1000.0f : 0.0f);
-    if (latched)
-        Serial.printf("[FUS] latch @%.6f,%.6f\n", latchLat, latchLon);
+    Serial.printf("[FUS] en=%d mode=%c have=%d sigma=%.1fm still=%.2f(%lus) rej=%lu "
+                  "hdopEma=%.1f coast=%d blocked=%d carried=%d rmcHeld=%d\n",
+                  fuseEn, fuseMode, nav.have, navSigmaM(&nav), fuseStillGet(),
+                  tStillSince ? (unsigned long)((millis() - tStillSince) / 1000) : 0UL,
+                  (unsigned long)navRej, nav.hdopEma, nav.inCoast, nav.coastBlocked,
+                  navCarried(&nav, millis()), rmcHeld);
+    if (epochOut.emit)
+        Serial.printf("[FUS] out @%.6f,%.6f spd=%.1f crs=%.0f(%d) est=%d\n",
+                      epochOut.lat, epochOut.lon, epochOut.spdMps, epochOut.crsDeg,
+                      epochOut.crsValid, epochOut.est);
 }

@@ -23,3 +23,9 @@ s3r/test/replay
 # ── 系统杂项 ────────────────────────────────────────────────────────────────
 .DS_Store
 *.swp
+s3r/test/nmea_rw_test
+s3r/test/inject_test.log
+
+# 外场电量/轨迹分析产物（含真实轨迹图）
+logs/
+s3r/test/nav_core_test

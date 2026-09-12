@@ -2,9 +2,9 @@
 //
 // 设计约束：设备装在口袋/包里，安装朝向完全未知且非刚性 → 一切算法只用
 // 姿态无关量：|a| 的块内标准差、|ω| 模长、重力方向（低通加速度）投影。
-//   - 静止检测：双阈滞回，进入慢(2.5s)退出快(0.25s)，供 fuse.ino 锁存判据
+//   - 静止检测：双阈滞回，进入慢(2.5s)退出快(0.25s)（v1 锁存判据遗留；v2 只做零偏校准窗）
 //   - 陀螺零偏：静止时自动校准（EMA），无需任何手工步骤
-//   - 航向角速率：ω 在重力轴上的投影 → 罗盘航向变化率（顺时针为正），供 DR 桥接
+//   - 航向角速率：ω 在重力轴上的投影 → 罗盘航向变化率（顺时针为正），供 coast 转动速度矢量
 // 硬件：M5Unified BMI270_Class + In_I2C（内部 I2C：SDA=G45 SCL=G0，addr 0x69）。
 // 不调 M5.begin()——屏幕仍归 screen.ino 的 M5GFX 管，互不相扰。
 #include "defs.h"
@@ -89,6 +89,7 @@ static int      featBlks    = 0;
 static void imuBlockDone(float accStd, float gyroMag, uint32_t now) {
     lastAccStd  = accStd;
     lastGyroMag = gyroMag;
+    fuseImuBlock(accStd, headRate, now);   // 估计器：1s 滑动最大 accStd + 航向角速率
 
     featSumStd += accStd;
     if (accStd > featMaxStd) featMaxStd = accStd;

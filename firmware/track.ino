@@ -19,12 +19,15 @@ static inline bool    fixHasCourse() { return liveFix.courseValid; }
 static inline float   fixCourseDeg() { return liveFix.courseDeg; }
 
 // Format one track point as a JSON object into buf; returns the length written.
+// v2 追加融合遥测 nav/sig/still/cn0/rej（服务端 iotService 同步加列；旧服务端会忽略未知键）
 static int fmtPoint(char* buf, int cap, const TrackPoint& p) {
     return snprintf(buf, cap,
         "{\"lat\":%.7f,\"lon\":%.7f,\"alt\":%d,\"spd\":%u,\"sat\":%u,"
-        "\"hdop\":%.1f,\"bat_mv\":%u,\"bat_pct\":%u,\"ts\":%lu}",
+        "\"hdop\":%.1f,\"bat_mv\":%u,\"bat_pct\":%u,\"ts\":%lu,"
+        "\"nav\":%u,\"sig\":%u,\"still\":%u,\"cn0\":%u,\"rej\":%u}",
         p.lat / 1e7, p.lon / 1e7, p.alt, p.spd, p.sat,
-        p.hdop / 10.0, p.bat_mv, p.bat_pct, (unsigned long)p.ts);
+        p.hdop / 10.0, p.bat_mv, p.bat_pct, (unsigned long)p.ts,
+        p.nav, p.sig, p.still, p.cn0, p.rej);
 }
 
 // Snapshot the current GPS fix + battery into a compact TrackPoint.
@@ -41,6 +44,28 @@ static void buildTrackPoint(TrackPoint& p) {
     p.hdop = h * 10.0f > 255.0f ? 255 : (uint8_t)(h * 10.0f);
     p.bat_mv  = phVolt(VM_BAT);
     p.bat_pct = (uint8_t)batPct;
+    // ── 融合遥测：估计器来源 / σ / 停留信念 / CN0 / 本 beacon 周期内的拒绝数 ──
+    static uint32_t rejBaseS3r = 0, rejBaseOwn = 0;   // 上个点的累计值（差分=本周期）
+    uint32_t nowMs = millis();
+    float sig = 0; uint32_t rejCum = 0, rejBase = 0; uint8_t nav = 0; float still = 0;
+#if !GNSS_TIMESHARE
+    if (s3rNavActive(nowMs)) {
+        nav = 1 | (liveFix.est ? 2 : 0);
+        sig = s3rNav.sigmaM; still = s3rNav.still;
+        rejCum = s3rNav.rej; rejBase = rejBaseS3r; rejBaseS3r = rejCum;
+    } else
+#endif
+    {
+        nav = 4;
+        sig = gnssOwnSigmaM();
+        rejCum = gnssOwnRejects(); rejBase = rejBaseOwn; rejBaseOwn = rejCum;
+    }
+    uint32_t dRej = rejCum >= rejBase ? rejCum - rejBase : rejCum;
+    p.nav   = nav;
+    p.sig   = sig > 255.0f ? 255 : (uint8_t)(sig + 0.5f);
+    p.still = (uint8_t)(still * 100.0f + 0.5f);
+    p.cn0   = gnssMaxCn0();
+    p.rej   = dRej > 255 ? 255 : (uint8_t)dRej;
 }
 
 // 存转（断网积压）已统一到 flashlog.ino 的 LittleFS 段日志（断电不丢）：
@@ -60,6 +85,7 @@ static double   glLastLat = 0, glLastLon = 0;   // 上一个"已接受"定位（
 static uint32_t glLastMs  = 0;                  // 参照点的 millis
 static bool     glHave    = false;              // 是否已有参照
 static uint32_t glRejSinceMs = 0;               // 当前连拒段的起点 millis（0=不在连拒中）
+static uint32_t glRejCount = 0;                 // 累计拒绝数（遥测 rej 字段的差分基础）
 
 // ── 二维匀速卡尔曼滤波状态 —— 配置A/B 共用，替代原先的中位数+EMA 两级平滑 ───────────
 // 0621 实测：HDOP/星数都"好"的连续快速移动区间仍会插入 1 个孤立跳变点(11:56:20 一例)，
@@ -211,6 +237,7 @@ static void gnssFeedLiveFix(double lat, double lon, uint32_t nowMs, float altM,
                              bool haveHdop, float hdop, bool haveSats, uint8_t sats) {
     float nhdop = haveHdop ? hdop : 25.5f;
     if (gnssIsGlitch(lat, lon, nowMs)) {
+        glRejCount++;
         Serial.printf("[GPS] reject glitch lat=%.6f lon=%.6f (impossible jump)\n", lat, lon);
         if (haveSats) liveFix.sats = sats;   // 只更新可见星/HDOP(现场判断用)
         liveFix.hdop = nhdop;
@@ -248,6 +275,40 @@ static void gnssFeedLiveFix(double lat, double lon, uint32_t nowMs, float altM,
     liveFix.courseDeg   = outCrs;
     liveFix.hdop        = nhdop;
     liveFix.sats        = haveSats ? sats : 0;
+    liveFix.est         = false;
+    liveFix.tMs         = nowMs;
+}
+
+// 野点参照 + KF 整体重置：S3R 估计器旁路 → 自家管线切回时调用。旁路期间自家 KF 没喂过
+// 数据，状态/参照都是旧的，直接续用会把"重新捕获的新位置"拖成一条假轨迹（同 resync 语义）。
+static void gnssPipelineReset() {
+    glHave = false; glRejSinceMs = 0;
+    kfHave = false;
+}
+static float gnssOwnSigmaM() {
+    if (!kfHave) return 0.0f;
+    double pmax = kfX.Pxx > kfY.Pxx ? kfX.Pxx : kfY.Pxx;
+    return (float)sqrt(pmax > 0 ? pmax : 0);
+}
+static uint32_t gnssOwnRejects() { return glRejCount; }
+
+// ── S3R 旁路入口：链路上的 NMEA 已由 S3R 估计器改写（坐标/速度/航向自洽、推算点标 quality 6）
+// ── 一条链路只能有一个估计器：这里不再过野点门、不再进 KF，原样进 liveFix。
+// 高度仍走轻量 EMA（S3R 不碰高度）；首拍（上次更新超 30s）直接置入。
+static void s3rFeedLiveFix(double lat, double lon, uint32_t nowMs, float altM, float spdKmh,
+                           bool haveCourse, float courseDeg, float hdop, uint8_t sats, bool est) {
+    bool first = !liveFix.valid || (nowMs - liveFix.tMs) >= GLITCH_RESYNC_MS;
+    altEmaM = first ? altM : altEmaM + ALT_EMA_ALPHA * (altM - altEmaM);
+    liveFix.valid       = true;
+    liveFix.lat         = lat;
+    liveFix.lon         = lon;
+    liveFix.altM        = altEmaM;
+    liveFix.spdKmh      = spdKmh;
+    liveFix.courseValid = haveCourse && spdKmh >= KF_COURSE_MIN_KMH;
+    liveFix.courseDeg   = liveFix.courseValid ? courseDeg : -1.0f;
+    liveFix.hdop        = hdop;
+    liveFix.sats        = sats;
+    liveFix.est         = est;
     liveFix.tMs         = nowMs;
 }
 

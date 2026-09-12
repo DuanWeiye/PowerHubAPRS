@@ -57,6 +57,25 @@ typedef struct {
     float    coastHdopMax;    // 断档前 hdop EMA 超此 → 本段 coast 整段不发（外推资格
                               // 需要可信的近期状态）；停留保持(v=0 钉住)不是外推，不受限。
                               // 0=关闭
+    // 0912 外场教训（进楼 63s 断档后接收机吐出 424m 外的伪定位 → 参照超龄"放行重建"
+    // 盲收 → 4s 后第二拍又差 97m → KF 速度 24m/s → 103km/h 飞点落进河里）：
+    // 断档后重捕获的"可达性门"。断档前是行人语境（KF 速度 < reacqPedSpdMps：步行/停留）
+    // 时，新定位到断档前参照的距离必须 ≤ 参照年龄×reacqWalkMps + reacqMarginM，否则拒收
+    // ——不重建、不更新参照，参照继续老化 → 界限随时间线性增长，人真走到了远处迟早放行；
+    // 参照年龄超过 reacqGateMaxGapMs 后一切皆有可能（进店/上车），门关闭无条件重建。
+    // 车辆语境（断档前 KF 速度高）不受影响，隧道后千米级重捕获照旧。
+    float    reacqPedSpdMps;    // 断档前 KF 速度低于此 = 行人语境（0=门关闭）
+    float    reacqWalkMps;      // 行人可达速度上限（m/s，含小跑）
+    float    reacqMarginM;      // 固定余量（楼体尺寸/多径，米）
+    uint32_t reacqGateMinGapMs; // 参照年龄低于此不设门（正常跟踪由野点门/NIS 处理）
+    uint32_t reacqGateMaxGapMs; // 参照年龄超过此门关闭
+    // 车辆证据放行：被门拒收的候选若连续自报速度 ≥ reacqPedSpdMps 达此时长（多普勒
+    // 速度与位置解相互独立，伪定位一般报步行量级），说明人已在车上 → 放行重建。
+    // 0808/0912 回放：电车出站/进站前后重捕获全是 14–23m/s，不放行会被门压 40–170s。
+    uint32_t reacqVehEvidenceMs;
+    // 重建时的速度初始化：RMC 自报速度/航向可用就以它起算（方差 initVelVarRaw），
+    // 而不是 initVelVar=2500(σ50m/s) 那种"两拍位置差全算成速度"的起点。
+    double   initVelVarRaw;
 } NavParams;
 
 static inline void navParamsDefault(NavParams* p) {
@@ -90,6 +109,14 @@ static inline void navParamsDefault(NavParams* p) {
     p->accStdCoastCarried = 1.0f; // 步行(被携带)coast：人转身/停步不可预测，σ 加速越界
     p->coastHdopRef   = 0.0f;     // 关：门限已覆盖病灶，速度折减会给好桥引入低速偏差
     p->coastHdopMax   = 2.5f;     // 断档前质量差 → 整段禁发（外推资格门）
+    // 0912 进楼飞点定版（test/nav_core_test.c 场景 + 0912 回放）：
+    p->reacqPedSpdMps   = 3.0f;   // 步行 ~1.3、停留 0；电车/汽车远高于此
+    p->reacqWalkMps     = 4.0f;   // 小跑量级；63s 断档 → 282m 界，424m 伪点拒收
+    p->reacqMarginM     = 30.0f;
+    p->reacqGateMinGapMs= 5000;
+    p->reacqGateMaxGapMs= 180000; // 3 分钟：进店/上车后一切皆有可能
+    p->reacqVehEvidenceMs= 2000;  // 2s 连续车速证据即放行（电车重捕获只多等 2s）
+    p->initVelVarRaw    = 100.0;  // σ10m/s：自报速度不准时 KF 仍能几秒内追上
 }
 
 // ── 1D KF（位置+速度，两轴各一份；与 track.ino Kf1D 同构，实现同源以便对照）────────
@@ -142,6 +169,9 @@ typedef struct {
     double   glLat, glLon;
     uint32_t glMs, glRejSince;
     uint32_t tCand;                   // 最近一个 valid 候选（无论是否被拒）的时刻
+    float    fixSpd;                  // 上次接受量测后的 KF 速度（重捕获可达性门的语境判据）
+    uint32_t reacqVehSince;           // 门拒收期间连续车速候选的起点（0=无）
+    uint32_t tGateRej;                // 可达性门最近一次拒收时刻（coast 歧义窗判据）
     bool     glHave;
     bool     nisPrev;
     // 停留信念
@@ -286,11 +316,36 @@ static inline void navFillOut(NavCore* n, NavOut* o, bool est,
     o->still  = n->still;
 }
 
+// 位置 1σ（米，两轴取大）——遥测/屏显用；未起算返回 0
+static inline float navSigmaM(const NavCore* n) {
+    if (!n->have) return 0.0f;
+    double pmax = n->kx.Pxx > n->ky.Pxx ? n->kx.Pxx : n->ky.Pxx;
+    return (float)sqrt(pmax > 0 ? pmax : 0);
+}
+
 // ── 主入口 1：一个 GNSS 定位候选（GGA 解析结果）。返回 false=本核心不出点（透传）。──
 static inline bool navGnss(NavCore* n, uint32_t ms, double lat, double lon,
                            float hdop, float rawSpdMps, float rawCrsDeg, NavOut* out) {
     out->emit = false;
     n->tCand = ms;
+    // 空/坏字段被解析成 0,0 却标 valid 的句子（0912 见 4 条，sats 0–3）：不是定位
+    if (lat == 0.0 && lon == 0.0) return false;
+    // 断档后重捕获可达性门（见 NavParams 注释）：行人语境下"断档时长走不到的地方"不认
+    bool release = false;                         // 车辆证据放行 → 按重建处理（KF 状态已不可信）
+    if (n->glHave && n->prm.reacqPedSpdMps > 0 && n->fixSpd < n->prm.reacqPedSpdMps) {
+        uint32_t age = ms - n->glMs;
+        if (age >= n->prm.reacqGateMinGapMs && age <= n->prm.reacqGateMaxGapMs) {
+            float bound = (float)age / 1000.0f * n->prm.reacqWalkMps + n->prm.reacqMarginM;
+            if (navDistM(lat, lon, n->glLat, n->glLon) > bound) {
+                n->tGateRej = ms;
+                if (rawSpdMps < n->prm.reacqPedSpdMps) { n->reacqVehSince = 0; return false; }
+                if (!n->reacqVehSince) n->reacqVehSince = ms;
+                if (ms - n->reacqVehSince < n->prm.reacqVehEvidenceMs) return false;
+                release = true;                   // 连续车速证据够了 → 放行并从新点重建
+            }
+        }
+    }
+    n->reacqVehSince = 0;
     // 参照超龄/强制放行 → KF 重置从新点起算（避免拖影/速度被踢飞，track.ino 同策略）
     bool forced = n->glRejSince && (ms - n->glRejSince >= n->prm.glForceMs);
     bool stale  = n->glHave && (ms - n->glMs >= n->prm.glResyncMs);
@@ -309,11 +364,20 @@ static inline bool navGnss(NavCore* n, uint32_t ms, double lat, double lon,
         }
         n->inCoast = false;
     }
-    if (!n->have || forced || stale) {
+    if (!n->have || forced || stale || release) {
         navReset(n, lat, lon);
         n->tProp = ms; n->tFix = ms;
         n->glLat = lat; n->glLon = lon; n->glMs = ms;
         n->glHave = true; n->glRejSince = 0;
+        // 速度态从自报值起算（航向仅在速度 ≥ crsMinMps 时可信；否则 v=0 起算）
+        if (rawSpdMps >= 0 && rawSpdMps < n->prm.glMaxMps) {
+            if (rawCrsDeg >= 0 && rawSpdMps >= n->prm.crsMinMps) {
+                double c = rawCrsDeg * M_PI / 180.0;
+                n->kx.v = rawSpdMps * sin(c); n->ky.v = rawSpdMps * cos(c);
+            }
+            n->kx.Pvv = n->ky.Pvv = n->prm.initVelVarRaw;
+            n->fixSpd = rawSpdMps;
+        } else n->fixSpd = 0;
         navFillOut(n, out, false, rawSpdMps, rawCrsDeg, true);
         n->firstEpoch = false;
         return true;
@@ -362,6 +426,8 @@ static inline bool navGnss(NavCore* n, uint32_t ms, double lat, double lon,
         navKf1UpdateVel(&n->ky, 0, Rz);
     }
 
+    n->fixSpd = sqrtf((float)(n->kx.v * n->kx.v + n->ky.v * n->ky.v));   // ZUPT 之后的值
+
     // 重锚定（长距离累积后保持局部平面近似有效）
     if (fabs(n->kx.p) > n->prm.reanchorM || fabs(n->ky.p) > n->prm.reanchorM) {
         double nl, no_;
@@ -383,6 +449,9 @@ static inline bool navCoast(NavCore* n, uint32_t ms, NavOut* out) {
     // （0808 回放：鬼影段拒绝窗里 coast 续发造成 6 拍 >150m 伪点）。1.5s 内没有新候选
     // 说明矛盾源消失，恢复真断档语义。
     if (n->glRejSince && ms - n->tCand <= 1500) return false;
+    // 可达性门拒收窗同理：GNSS 在场但被判"走不到"，是歧义不是断档（0808 回放：车辆证据
+    // 等待的 2s 里续发 coast 会把桥接终点误差从 20m 推到 290m）
+    if (n->tGateRej && ms - n->tGateRej <= 1500) return false;
     if (n->still >= n->prm.zuptOn) {              // 停留保持：记账硬上限
         if (!n->tCoastStill0) n->tCoastStill0 = ms;
         if (ms - n->tCoastStill0 > n->prm.coastStillCapMs) return false;

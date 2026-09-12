@@ -2,6 +2,13 @@
 // 配置A/B 共用。
 #include "defs.h"
 
+// 全星座最强 CN0（遥测 cn0 字段）
+static uint8_t gnssMaxCn0() {
+    uint8_t m = 0;
+    for (int k = 0; k < 6; k++) if (gnssCN0[k] > m) m = gnssCN0[k];
+    return m;
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // GNSS 信号诊断解析（解析一整行 NMEA）
 // 只看 GSV（星座/CN0/可见星数）与 TXT（天线状态）；不碰 TinyGPS++（它另收同样字节）。
@@ -141,7 +148,7 @@ static void pwrlogDump() {
 // Non-blocking single-line command reader on the USB serial console:
 //   log  = dump power log | logclear = erase | gnsstest = 分时切换测速 | help
 static void checkSerialCommands() {
-    static char buf[80];
+    static char buf[160];                  // gpsin 一整句 NMEA（≤82）+ 前缀
     static uint8_t len = 0;
     while (Serial.available()) {
         char c = Serial.read();
@@ -157,13 +164,36 @@ static void checkSerialCommands() {
                 Serial.printf("[AT<] %s\n", catmCmd(String(buf), 16000).c_str());
                 continue;
             }
+            // 链路注入（保留大小写）：把一行原样发到 PORT.C 的 GPS 链路。用途：①给模块发
+            // PCAS 配置；②台面假点注入——S3R 收到 "$S3R,NMEA,<句>" 会把该句当 GPS 输出喂进
+            // 估计器，改写结果原路回到这里被正常解析，不出门即可端到端验证融合链。
+            if (!strncmp(buf, "gpsin ", 6)) {
+                gpsSerial.print(buf + 6); gpsSerial.print("\r\n");
+                continue;
+            }
             for (char *p = buf; *p; p++) if (*p >= 'A' && *p <= 'Z') *p += 32;
             if      (!strcmp(buf, "log"))      pwrlogDump();
             else if (!strcmp(buf, "logclear")) { pwrlogClear(); Serial.println("[PWRLOG] cleared"); }
             else if (!strcmp(buf, "sendtest"))  { forceSendReq = true; Serial.println("[CMD] 强制发包"); }
             else if (!strcmp(buf, "gnsstest")) gnssSwitchTest();
             else if (!strcmp(buf, "atscan"))   atScan();
+            // PORT.C 供电手控：S3R 接 USB 前先 pcoff，避免 USB 5V 与 Grove 5V 并联（无隔离）
+            else if (!strcmp(buf, "pcoff")) { phPower(PC_UART, false); Serial.println("[PH] PORT.C 5V OFF"); }
+            else if (!strcmp(buf, "pcon"))  { phPower(PC_UART, true);  Serial.println("[PH] PORT.C 5V ON"); }
 #if !GNSS_TIMESHARE
+            else if (!strcmp(buf, "s3rnav")) {
+                uint32_t now = millis();
+                Serial.printf("[S3R] nav %s: en=%d mode=%c sig=%.1fm still=%.2f spd=%.1fm/s hdopEma=%.1f "
+                              "rej=%lu carried=%d accStd=%.2f hr=%.1f lines=%lu age=%lums lastGGAq=%u\n",
+                              s3rNavActive(now) ? "ONLINE(旁路自家KF)" : "offline(自家KF)",
+                              s3rNav.en, s3rNav.mode, s3rNav.sigmaM, s3rNav.still, s3rNav.spdMps,
+                              s3rNav.hdopEma, (unsigned long)s3rNav.rej, s3rNav.carried, s3rNav.accStd,
+                              s3rNav.headRate, (unsigned long)s3rNav.lines,
+                              s3rNav.tLast ? (unsigned long)(now - s3rNav.tLast) : 0UL, lastGgaQual);
+                Serial.printf("[S3R] liveFix valid=%d est=%d lat=%.6f lon=%.6f spd=%.1f hdop=%.1f sats=%u age=%lums\n",
+                              liveFix.valid, liveFix.est, liveFix.lat, liveFix.lon, liveFix.spdKmh,
+                              liveFix.hdop, liveFix.sats, liveFix.valid ? (unsigned long)(now - liveFix.tMs) : 0UL);
+            }
             // ── S3R 协处理器链路（配置A：PORT.C，见 config_a.ino s3r*）──
             else if (!strcmp(buf, "s3rbridge")) s3rBridgeMode();
             else if (!strcmp(buf, "s3rping")) {
@@ -213,7 +243,7 @@ static void checkSerialCommands() {
                 "[CMD] log|logclear|sendtest|at<cmd>|gnsstest|atscan | flfill<n>|flflush|flstat|flclear|flhold | help");
 #else
             else if (!strcmp(buf, "help"))     Serial.println(
-                "[CMD] log|logclear|sendtest|at<cmd>|gnsstest|atscan | s3rbridge|s3rping|s3rinfo|s3rfuse on/off | help");
+                "[CMD] log|logclear|sendtest|at<cmd>|gnsstest|atscan|pcon|pcoff|gpsin <nmea> | s3rbridge|s3rping|s3rinfo|s3rimu|s3rnav|s3rfuse on/off | help");
 #endif
             else Serial.printf("[CMD] unknown: '%s' (try: help)\n", buf);
         } else if (len < sizeof(buf) - 1) {

@@ -84,6 +84,9 @@ static uint32_t  tLastLcdDraw = 0;        // 上次重绘时刻
 static uint32_t tLastNmeaByte = 0;   // 最近一次从 PORT.C 收到字节（链路看门狗判断流）
 static uint32_t tLastS3rPing  = 0;   // 上次发 $S3R,PING 心跳
 static uint32_t tS3rLastSeen  = 0;   // 上次收到 $S3R 行（0=从未；GPS 直连时恒 0）
+static S3rNav   s3rNav;              // $PFUSE 心跳解析结果（估计器在线判据 + 遥测）
+static bool     s3rBypassPrev = false;   // 上轮是否处于"旁路自家 KF"状态（切换时打日志/重置）
+static uint8_t  lastGgaQual   = 0;   // 最近一条 GGA 的 fix quality（6 = S3R 推算点）
 #endif
 
 // ── GNSS 信号诊断（从 GSV/TXT 自解析，由电量日志按采样间隔快照）─────────────────
@@ -92,7 +95,7 @@ static uint8_t gnssInView[6] = {0};  // 各系统可见卫星数（最近一个�
 static uint8_t gnssCN0[6]    = {0};  // 各系统最强 CN0/信噪比 dBHz（最近一个周期）
 static uint8_t gnssAccCN0[6] = {0};  // 当前进行中周期内的 CN0 累加器
 static uint8_t gnssAnt       = 0;    // 天线: 0 未知 / 1 OK / 2 开路 / 3 短路
-static char    nmeaLine[192];        // 整行装配缓冲：NMEA 最长 82，但 $S3R,INFO 应答 ~150 字符
+static char    nmeaLine[256];        // 整行装配缓冲：NMEA 最长 82，但 $S3R,INFO 应答 ~200 字符（v0.3）
 static uint8_t nmeaLen       = 0;
 
 static GpsState  gpsState      = GS_DETECTING;

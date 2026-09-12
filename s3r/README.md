@@ -17,12 +17,16 @@ PowerHub PORT.C(蓝, G1/G2) ←Grove→ AtomS3R 自带口(G1/G2)
 |---|---|---|
 | ① | 透传：GPS↔PowerHub 双向转发（行为与直连严格一致）+ 屏显 + UART-OTA | v0.1.1 完成 |
 | ② | IMU 旁路记录：BMI270+NMEA 记 LittleFS 环形日志，`imu_fetch.py`/`imu_decode.py` 拉取解码，外场数据离线调融合参数 | **v0.2.0 完成** |
-| ③ | ESKF 融合上线：输出融合 NMEA + `$PFUSE`；PCAS 配置从 PowerHub 搬来 | **融合 v1 已上线**（静止锁存+短断档DR+GNSS逃生门，见 HANDOFF)；完整 ESKF 等②的外场数据离线调参 |
+| ③ | 融合上线：输出融合 NMEA + `$PFUSE`；PowerHub 旁路自家 KF 直接消费 + 上传遥测 | **v0.3.0 完成（2026-08-22，nav_core v2）**；v1 三开关已删；完整 ESKF 已砍（包内姿态未知，加计积分是伪能力） |
 
-融合 v1（默认开，`fuse off`/PowerHub `s3rfuse off` 可关，NVS 持久）只在证据充分时
-改写 GGA/RMC：IMU 判静止→坐标锁到定位中位数（停留漂移云→一个点）；静止中丢定位→
-锁点续发（quality=6）；移动中丢定位≤15s/60m→速度+陀螺航向 DR 续点（quality=6）；
-原始定位持续远离锁点→逃生门强制解锁（IMU 永远锁不死轨迹）。其余一切原样透传。
+融合 v2（默认开，`fuse off`/PowerHub `s3rfuse off` 可关，NVS 持久）：唯一估计器
+`nav_core.h`（2D 匀速 KF + 连续停留信念/ZUPT + 诚实 coast，参数经 0808/0816/0822 三份
+外场数据回放定版）。每拍 GGA 驱动估计器（RMC 先暂存、同拍一起放），IMU 提供 1s 滑动
+accStd（"被携带"证据）与陀螺航向角速率（coast 转向）。输出：跟踪点换坐标/速度/航向；
+推算点 GGA quality=6 / RMC 模式 E，σ>40m 即停发；被野点门拒的拍标 q=0/V；其余原样透传。
+`$PFUSE,2,…` 1Hz 心跳让 PowerHub 旁路自家野点门/KF（单估计器原则），上传报文带
+nav/sig/still/cn0/rej 遥测。台面验证：`test/inject_test.py`（经 PowerHub `gpsin` 注入合成
+轨迹，不出门跑通静止/步行/断档/恢复）。
 
 ## 构建 / 刷写
 

@@ -130,7 +130,7 @@ static bool sendGpsData(bool queueOnFail) {
         return false;
     }
 
-    char body[160];
+    char body[224];                               // v2 点 ~180 字符（含融合遥测）
     int bodyLen = fmtPoint(body, sizeof(body), cur);
     Serial.printf("[CM] body(%d): %s\n", bodyLen, body);
 
@@ -225,12 +225,22 @@ static void configLoopFeed(uint32_t now) {
         // whether the module sees any satellites (look for $GNGSV SNR values).
         if (now - tBoot < GPS_RAW_DUMP_MS)
             Serial.write(c);
-        // 装配整行 → $S3R 协议行给链路处理，其余喂 GNSS 信号诊断（CN0/星座/天线）
+        // 装配整行 → $S3R 协议行给链路处理 / $PFUSE 估计器心跳 / 其余喂 GNSS 信号诊断
         if (c == '\n' || c == '\r') {
             if (nmeaLen) {
                 nmeaLine[nmeaLen] = 0;
-                if (!strncmp(nmeaLine, "$S3R,", 5)) s3rLinkLine(nmeaLine);
-                else                                gnssDiagLine(nmeaLine);
+                if      (!strncmp(nmeaLine, "$S3R,", 5))   s3rLinkLine(nmeaLine);
+                else if (!strncmp(nmeaLine, "$PFUSE,", 7)) s3rFuseLine(nmeaLine);
+                else {
+                    gnssDiagLine(nmeaLine);
+                    // GGA 第 6 字段 = fix quality（6 = S3R 推算点）。TinyGPS++ 不暴露该字段，
+                    // 自己从整行里取：跳 6 个逗号。
+                    if (nmeaLen > 6 && nmeaLine[3] == 'G' && nmeaLine[4] == 'G' && nmeaLine[5] == 'A') {
+                        const char* q = nmeaLine; int k = 0;
+                        while (*q && k < 6) { if (*q == ',') k++; q++; }
+                        if (k == 6 && *q >= '0' && *q <= '9') lastGgaQual = (uint8_t)(*q - '0');
+                    }
+                }
                 nmeaLen = 0;
             }
         } else if (nmeaLen < sizeof(nmeaLine) - 1) {
@@ -243,13 +253,31 @@ static void configLoopFeed(uint32_t now) {
     // TinyGPS++ 刚解出一个新定位 → 喂野点过滤+卡尔曼平滑，写共享 liveFix(见 track.ino
     // gnssFeedLiveFix)。isUpdated() 读一次即自清，和 isValid()/age() 是各自独立的标志，
     // 不影响别处（比如下面 updateGps 的搜星诊断日志）继续读 gps.location 的原始状态。
+    // S3R 估计器在线（$PFUSE en=1 且新鲜）→ 旁路自家野点门+KF（单估计器原则）；
+    // 心跳消失 >S3R_NAV_HOLD_MS 自动回落自家管线（透传/摘除 S3R 兜底），切回时重置自家 KF。
+    bool byp = s3rNavActive(now);
+    if (byp != s3rBypassPrev) {
+        s3rBypassPrev = byp;
+        if (!byp) gnssPipelineReset();
+        Serial.printf("[S3R] nav %s → %s\n", byp ? "online" : "offline",
+                      byp ? "旁路自家野点门/KF，直接消费 S3R 输出" : "回落自家野点门/KF（已重置）");
+    }
     if (gps.location.isUpdated() && gps.location.isValid()) {
-        gnssFeedLiveFix(gps.location.lat(), gps.location.lng(), now,
-                        gps.altitude.isValid() ? gps.altitude.meters() : 0.0f,
-                        gps.speed.isValid(), gps.speed.isValid() ? gps.speed.kmph() : 0.0f,
-                        gps.course.isValid(), gps.course.isValid() ? gps.course.deg() : -1.0f,
-                        gps.hdop.isValid(), gps.hdop.isValid() ? gps.hdop.hdop() : 25.5f,
-                        gps.satellites.isValid(), gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0);
+        if (byp)
+            s3rFeedLiveFix(gps.location.lat(), gps.location.lng(), now,
+                           gps.altitude.isValid() ? gps.altitude.meters() : 0.0f,
+                           gps.speed.isValid() ? gps.speed.kmph() : 0.0f,
+                           gps.course.isValid(), gps.course.isValid() ? gps.course.deg() : -1.0f,
+                           gps.hdop.isValid() ? gps.hdop.hdop() : 25.5f,
+                           gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0,
+                           lastGgaQual == 6);
+        else
+            gnssFeedLiveFix(gps.location.lat(), gps.location.lng(), now,
+                            gps.altitude.isValid() ? gps.altitude.meters() : 0.0f,
+                            gps.speed.isValid(), gps.speed.isValid() ? gps.speed.kmph() : 0.0f,
+                            gps.course.isValid(), gps.course.isValid() ? gps.course.deg() : -1.0f,
+                            gps.hdop.isValid(), gps.hdop.isValid() ? gps.hdop.hdop() : 25.5f,
+                            gps.satellites.isValid(), gps.satellites.isValid() ? (uint8_t)gps.satellites.value() : 0);
     }
     s3rLinkTick(now);   // S3R 心跳 + NMEA 断流看门狗
 }
@@ -336,6 +364,46 @@ static void configForceUpload() {
 static void s3rLinkLine(const char* s) {
     tS3rLastSeen = millis();
     Serial.printf("[S3R] %s\n", s);
+}
+
+// $PFUSE,2,<en>,<mode>,<σm>,<still>,<spd>,<hdopEma>,<rej>,<carried>,<accStd>,<headRate>*cs
+// （s3r/fuse.ino fuseTick 1Hz）。只认版本 2；校验和坏的行不采信。
+static void s3rFuseLine(const char* s) {
+    if (s[0] != '$') return;
+    // 校验和
+    const char* star = strchr(s, '*');
+    if (!star) return;
+    uint8_t cs = 0;
+    for (const char* p = s + 1; p < star; p++) cs ^= (uint8_t)*p;
+    if ((unsigned)strtoul(star + 1, nullptr, 16) != cs) return;
+    // 逐字段
+    const char* f[14]; int nf = 0;
+    f[nf++] = s + 1;
+    for (const char* p = s + 1; p < star && nf < 14; p++) if (*p == ',') f[nf++] = p + 1;
+    if (nf < 12 || atoi(f[1]) != 2) return;
+    s3rNav.tLast    = millis();
+    s3rNav.en       = atoi(f[2]) != 0;
+    s3rNav.mode     = f[3][0];
+    s3rNav.sigmaM   = atof(f[4]);
+    s3rNav.still    = atof(f[5]);
+    s3rNav.spdMps   = atof(f[6]);
+    s3rNav.hdopEma  = atof(f[7]);
+    s3rNav.rej      = strtoul(f[8], nullptr, 10);
+    s3rNav.carried  = atoi(f[9]) != 0;
+    s3rNav.accStd   = atof(f[10]);
+    s3rNav.headRate = atof(f[11]);
+    s3rNav.lines++;
+    tS3rLastSeen = s3rNav.tLast;                 // 心跳也算存活
+    if ((s3rNav.lines % 60) == 1)                // 每分钟 1 行进日志（1Hz 全记会刷屏）
+        Serial.printf("[S3R] nav en=%d mode=%c sig=%.1f still=%.2f spd=%.1f hdop=%.1f rej=%lu carried=%d\n",
+                      s3rNav.en, s3rNav.mode, s3rNav.sigmaM, s3rNav.still, s3rNav.spdMps,
+                      s3rNav.hdopEma, (unsigned long)s3rNav.rej, s3rNav.carried);
+}
+
+static bool s3rNavActive(uint32_t now) {
+    // 有符号差：调用方的 now 多取自 loop 顶，而 tLast 在同一轮里可能刚被刷成更晚的 millis，
+    // 无符号相减会下溢成"超龄"（台面实测：每半秒在线/离线抖动一次）。
+    return s3rNav.tLast && s3rNav.en && (int32_t)(now - s3rNav.tLast) < (int32_t)S3R_NAV_HOLD_MS;
 }
 
 // 每 ~60s 心跳 + NMEA 断流看门狗（configLoopFeed 末尾每轮调用）

@@ -68,21 +68,32 @@ static void s3rHandleLine(const char* line, Stream* io) {
         imulogStats(&ilTotal, &ilSegs, &ilSumSegs);
         io->printf("$S3R,INFO,ver=%s,part=%s,pend=%d,up=%lus,heap=%lu,"
                    "gpsRX=G%d,linkRX=G%d,bps=%lu,csOK=%lu,csFail=%lu,"
-                   "sats=%u,hdop=%.1f,ant=%u,imu=%d,fuse=%d,mode=%c,log=%luK/%u\r\n",
+                   "sats=%u,hdop=%.1f,ant=%u,imu=%d,fuse=%d,mode=%c,still=%.2f,sig=%.0f,"
+                   "log=%luK/%u,ilfail=%lu,free=%luK\r\n",
                    S3R_FW_VER, otaRunningPartition(), otaPending ? 1 : 0,
                    (unsigned long)(millis() / 1000), (unsigned long)ESP.getFreeHeap(),
                    gpsRxPin, linkRxPin, (unsigned long)gpsBps,
                    (unsigned long)gps.passedChecksum(), (unsigned long)gps.failedChecksum(),
                    gps.satellites.isValid() ? (unsigned)gps.satellites.value() : 0,
                    gps.hdop.isValid() ? gps.hdop.hdop() : -1.0f, gnssAnt,
-                   imuOk() ? 1 : 0, fuseEnabledGet() ? 1 : 0,
-                   fuseIsLatched() ? 'L' : (fuseIsDr() ? 'D' : 'P'),
-                   (unsigned long)(ilTotal / 1024), ilSegs);
+                   imuOk() ? 1 : 0, fuseEnabledGet() ? 1 : 0, fuseModeGet(),
+                   fuseStillGet(), fuseSigmaGet(),
+                   (unsigned long)(ilTotal / 1024), ilSegs,
+                   (unsigned long)imulogWriteFails(), (unsigned long)imulogFreeKB());
         return;
     }
     if (strncmp(line, "$S3R,FUSE,", 10) == 0) {
         fuseSetEnabled(strncmp(line + 10, "ON", 2) == 0);
         io->printf("$S3R,FUSE,%s\r\n", fuseEnabledGet() ? "ON" : "OFF");
+        return;
+    }
+    if (strncmp(line, "$S3R,NMEA,", 10) == 0) {
+        // 台面假点注入："$S3R,NMEA,GNGGA,...*hh" → 当作 GPS 吐出的 "$GNGGA,...*hh" 喂进融合行泵
+        // （校验和由发送方算好；坏校验和会被 fuseProcessLine 当坏行原样转发——与真 GPS 同语义）。
+        // 真 GPS 流仍在同时到达，注入只用于室内端到端验证，外场不会有人往链路发这种行。
+        char inj[128];
+        snprintf(inj, sizeof(inj), "$%s", line + 10);
+        fuseInjectLine(inj);
         return;
     }
     if (strncmp(line, "$S3R,IMUDUMP", 12) == 0) {
@@ -101,8 +112,7 @@ static void s3rHandleLine(const char* line, Stream* io) {
                    imuIsStationary() ? 1 : 0,
                    imuIsStationary() ? (unsigned long)((millis() - imuStationarySince()) / 1000) : 0UL,
                    imuAccStd(), imuGyroMag(), imuHeadingRateDps(),
-                   imuBiasKnown() ? 1 : 0, fuseEnabledGet() ? 1 : 0,
-                   fuseIsLatched() ? 'L' : (fuseIsDr() ? 'D' : 'P'));
+                   imuBiasKnown() ? 1 : 0, fuseEnabledGet() ? 1 : 0, fuseModeGet());
         return;
     }
     if (strncmp(line, "$S3R,OTA,BEGIN,", 15) == 0) {

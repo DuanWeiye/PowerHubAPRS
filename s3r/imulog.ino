@@ -8,17 +8,22 @@
 // 记录 = [type u8][定长负载]（小端，布局见 defs.h ILOG_*）。
 // 拉取：$S3R,IMUDUMP 分块 ACK 协议（两层一起拉，SEG 行带路径），host 端 imu_fetch.py；
 // 解码 imu_decode.py（按类型自识别，摘要层出 _sgnss/_feat CSV）。
-// 省流：深度静止（锁存 >2min，v1 遗留观察）暂停全速率 IMU、GNSS 降 1Hz；摘要层不省
+// 省流：深度停留（still≥zuptOn 持续 >2min）暂停全速率 IMU、GNSS 降 1Hz；摘要层不省
 // ——它本来就是低速率，全天连续才有价值。
 #include "defs.h"
 
 // ── 环形段管理（两层共用一套实现；struct IlRing 定义在 defs.h，自动原型坑）─────────
-static IlRing   ilR  = { "/il",  "ilseq", ILOG_SEG_MAX,     File(), 0, {0}, 0 };
-static IlRing   isR  = { "/ils", "isseq", ILOG_SUM_SEG_MAX, File(), 0, {0}, 0 };
+static IlRing   ilR  = { "/il",  "ilseq", ILOG_SEG_MAX,     File(), {0}, 0, {0}, 0 };
+static IlRing   isR  = { "/ils", "isseq", ILOG_SUM_SEG_MAX, File(), {0}, 0, {0}, 0 };
 static bool     ilOK        = false;
+// 写盘失败记账（0822 外场：bin 里出现"上一段数据写了两遍、第一遍半条截断"，疑底层写失败后
+// 重试；先把失败次数/字节数记下来并进 INFO/EVT，下一批数据定根因）
+static uint32_t ilWriteFail      = 0;
+static uint32_t ilWriteFailBytes = 0;
+static bool     ilWriteFailPend  = false;   // 有失败未落 EVT（写成功后由 tick 补记）
 static uint32_t tIlFlush    = 0;
 static uint32_t tIlTime     = 0;       // 'T' 时间对齐记录节流
-static uint32_t tLatchStart = 0;       // fuse 锁存起始（省流观察，v1 遗留）
+static uint32_t tLatchStart = 0;       // 停留信念满(still≥zuptOn)起始——全速率省流判据
 static uint32_t tGnssLast   = 0;       // 深度静止时全速率 GNSS 1Hz 节流
 static uint32_t tSumGnssLast= 0;       // 摘要层 GNSS 抽取节流
 
@@ -56,6 +61,7 @@ static void ilOpenNext(IlRing& r) {
     uint32_t seq = prefs.getULong(r.seqKey, 0) + 1;
     prefs.putULong(r.seqKey, seq);
     snprintf(name, sizeof(name), "%s/s%08lu.bin", r.dir, (unsigned long)seq);
+    strlcpy(r.name, name, sizeof(r.name));
     r.f = LittleFS.open(name, "w");
     r.curSize = 0;
     if (!r.f) { ilOK = false; Serial.printf("[IL] open %s FAIL\n", name); }
@@ -63,9 +69,14 @@ static void ilOpenNext(IlRing& r) {
 
 static void ilFlushBuf(IlRing& r) {
     if (!ilOK || !r.f || !r.bufLen) return;
-    r.f.write(r.buf, r.bufLen);
+    size_t w = r.f.write(r.buf, r.bufLen);
+    if (w != r.bufLen) {                       // 短写/失败：记账（数据丢弃，不重试——重试正是
+        ilWriteFail++;                         // 重复写的嫌疑路径；先拿到计数再定策略）
+        ilWriteFailBytes += r.bufLen - w;
+        ilWriteFailPend = true;
+    }
     r.f.flush();
-    r.curSize += r.bufLen;
+    r.curSize += w;
     r.bufLen = 0;
     if (r.curSize >= ILOG_SEG_BYTES) {         // 段满 → 轮转
         r.f.close();
@@ -106,7 +117,7 @@ static void imulogBegin() {
 
 static void imulogImuRaw(uint32_t tms, const int16_t a[3], const int16_t g[3]) {
     // 深度静止（锁存 >2min）暂停全速率 IMU 记录省环形空间
-    if (tLatchStart && tms - tLatchStart > 120000UL) return;
+    if (tLatchStart && tms - tLatchStart > NAV_STILL_SAVE_MS) return;
     struct __attribute__((packed)) { uint8_t t; uint32_t ms; int16_t v[6]; } r;
     r.t = ILOG_IMU; r.ms = tms;
     r.v[0]=a[0]; r.v[1]=a[1]; r.v[2]=a[2]; r.v[3]=g[0]; r.v[4]=g[1]; r.v[5]=g[2];
@@ -135,7 +146,7 @@ static void imulogGnss(uint32_t tms, double lat, double lon, float altM,
         ilWrite(isR, &r, sizeof(r));
         r.t = ILOG_GNSS;
     }
-    if (tLatchStart && tms - tLatchStart > 120000UL) {     // 深度静止全速率降 1Hz
+    if (tLatchStart && tms - tLatchStart > NAV_STILL_SAVE_MS) {   // 深度停留全速率降 1Hz
         if (tms - tGnssLast < 1000) return;
     }
     tGnssLast = tms;
@@ -197,9 +208,13 @@ static uint32_t ilEpochFrom(int y, int mo, int d, int h, int mi, int s) {
 
 static void imulogTick(uint32_t now) {
     if (!ilOK) return;
-    // 锁存起始观察（供省流判据）
-    if (fuseIsLatched()) { if (!tLatchStart) tLatchStart = now; }
-    else tLatchStart = 0;
+    // 停留信念满（still≥zuptOn）起始 → 全速率省流判据（>NAV_STILL_SAVE_MS 后 IMU 停记/GNSS 降 1Hz）
+    tLatchStart = fuseStillLatched() ? fuseStillSince() : 0;
+    // 写盘失败补记 EVT（在失败之后的第一次成功 tick 里写，避免在失败路径里递归写）
+    if (ilWriteFailPend && ilR.bufLen + 10 <= sizeof(ilR.buf)) {
+        ilWriteFailPend = false;
+        imulogEvent(EV_IL_WFAIL, (float)ilWriteFail);
+    }
     // 周期落盘（掉电最多丢 2s）
     if (now - tIlFlush >= ILOG_FLUSH_MS) {
         tIlFlush = now;
@@ -240,6 +255,12 @@ static void imulogStats(uint32_t* totalBytes, uint16_t* segs, uint16_t* sumSegs)
     if (sumSegs)    *sumSegs = (uint16_t)n2;
 }
 
+static uint32_t imulogWriteFails() { return ilWriteFail; }
+static uint32_t imulogFreeKB() {
+    if (!ilOK) return 0;
+    return (uint32_t)((LittleFS.totalBytes() - LittleFS.usedBytes()) / 1024);
+}
+
 static void imulogClear() {
     if (!ilOK) return;
     ilR.f.close(); ilR.bufLen = 0;
@@ -255,10 +276,26 @@ static void imulogClear() {
 }
 
 // ── $S3R,IMUDUMP：分块 ACK 传输（两层一起；阻塞，期间透传暂停）────────────────────
+// 活动段（正在写的文件）在 dump 期间必须先关写句柄：LittleFS 不支持同一文件双开，
+// 0822 拉回的 bin 里活动段尾部混进了几十秒前的陈旧块就是这么来的。dump 后以追加重开。
+static void ilCloseForDump(IlRing& r)  { ilFlushBuf(r); if (r.f) r.f.close(); }
+static void ilReopenAfterDump(IlRing& r) {
+    if (!ilOK) return;
+    r.f = LittleFS.open(r.name, "a");
+    if (!r.f) { Serial.printf("[IL] reopen %s FAIL → new seg\n", r.name); ilOpenNext(r); }
+}
+
+static void imulogDumpInner(Stream* io);
 static void imulogDump(Stream* io) {
     if (!ilOK) { io->println("$S3R,IMUDUMP,ERR,nolog"); return; }
-    ilFlushBuf(ilR);
-    ilFlushBuf(isR);
+    ilCloseForDump(ilR);
+    ilCloseForDump(isR);
+    imulogDumpInner(io);
+    ilReopenAfterDump(ilR);
+    ilReopenAfterDump(isR);
+}
+
+static void imulogDumpInner(Stream* io) {
     String names[2 * (ILOG_SUM_SEG_MAX + 2)];
     int n = ilListSegs(ilR.dir, names, ILOG_SEG_MAX + 2);
     n += ilListSegs(isR.dir, names + n, ILOG_SUM_SEG_MAX + 2);

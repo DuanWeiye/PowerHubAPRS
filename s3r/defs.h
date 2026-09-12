@@ -7,7 +7,7 @@
 //   GPS(ABC Base 蓝口) ↔ PowerHub(自带 Grove 口) 双向透明转发，行为与"GPS 直连
 //   PowerHub"严格一致（PowerHub 固件零改动）；旁路解析 NMEA 供屏显；
 //   UART-OTA 接收器 + A/B 槽启动确认（以后更新固件全走 PowerHub 透传桥，不拆机）。
-// 第②步加 IMU 旁路记录，第③步 ESKF 融合上线（见 s3r/README.md 路线图）。
+// 第②步 IMU 旁路记录（v0.2）；第③步 v0.3 = nav_core v2 融合上线（fuse.ino 改写 GGA/RMC）。
 #pragma once
 #include <Arduino.h>
 #include <M5GFX.h>      // 须在此（而非 screen.ino）：Arduino 自动原型会被提升到主文件
@@ -17,7 +17,7 @@
 #include <LittleFS.h>   // IMU/GNSS 环形日志（spiffs 分区 1.5MB）
 #include "nmea_rw.h"    // NMEA 解析/改写/重建纯 C 核心（主机可单测）
 
-#define S3R_FW_VER "0.2.0"
+#define S3R_FW_VER "0.3.1"
 
 // ═══════════════════════════════════════════════════════════════════════════
 // 引脚
@@ -85,22 +85,11 @@ static const int      IMU_BIAS_BLKS      = 8;        // 零偏窗：8 块 = 2s
 static const float    IMU_BIAS_EMA       = 0.3f;     // 后续更新的 EMA 权重
 static const int      IMU_LOG_DECIM      = 4;        // 落盘抽取：4 样本平均 → 25Hz
 
-// ── 融合 v1（fuse.ino：静止锁存 + 短断档 DR 桥接 + GNSS 逃生门）────────────────
-static const uint32_t FUSE_LATCH_MIN_STAT_MS = 3000;   // 静止满 3s 才锁存
-static const int      FUSE_HIST_N        = 15;       // 定位历史环（5Hz×3s，取中位数做锁点）
-static const int      FUSE_HIST_MIN      = 5;        // 至少 5 个新鲜历史点才允许锁存
-static const uint32_t FUSE_HIST_FRESH_MS = 4000;     // "新鲜"= 4s 内
-static const float    FUSE_HIST_HDOP_MAX = 6.0f;     // 历史点收录的 HDOP 上限
-static const float    FUSE_ESC_DIST_M    = 35.0f;    // 逃生门：原始定位离锁点超此距离
-static const uint32_t FUSE_ESC_MS        = 8000;     // 且持续 8s（HDOP<4）→ 强制解锁
-static const float    FUSE_ESC_HDOP      = 4.0f;
-static const uint32_t FUSE_DR_START_MS   = 3000;     // 断档前最后好定位 3s 内才允许起 DR
-static const uint32_t FUSE_DR_MAX_MS     = 15000;    // DR 最长桥 15s
-static const float    FUSE_DR_MAX_DIST_M = 60.0f;    // 或累计 60m，超过即停（诚实丢定位）
-static const float    FUSE_DR_MIN_SPD    = 0.5f;     // m/s：低于此不起 DR（步速下限）
-static const float    FUSE_DR_SPD_DECAY  = 0.03f;    // DR 速度衰减 3%/s（不确定性递增的保守化）
-static const float    FUSE_DR_HDOP_OK    = 4.0f;     // "好定位"参考点的 HDOP 上限
-static const uint32_t FUSE_PFUSE_MS      = 1000;     // $PFUSE 诊断句周期
+// ── 融合 v2（fuse.ino + nav_core.h；估计器参数见 nav_core.h navParamsDefault）────────
+static const uint32_t FUSE_PFUSE_MS      = 1000;     // $PFUSE 心跳/诊断句周期（PowerHub 据此旁路自家 KF）
+static const uint32_t NAV_RMC_HOLD_MS    = 300;      // RMC 暂存等 GGA 的上限（每拍 RMC→VTG→GGA 实测 <20ms）
+static const float    NAV_EST_HDOP_FILL  = 5.0f;     // 推算点 GGA 无 HDOP 时的补值
+static const uint32_t NAV_STILL_SAVE_MS  = 120000UL; // still≥zuptOn 持续超此 → 全速率日志省流
 
 // ── IMU/GNSS 双层环形日志（imulog.ino，LittleFS，P2 重分区后 FS≈4.875MB）─────────
 // 全速率层 /il/：25Hz IMU + 5Hz GNSS + 事件——疑难段深挖用，环形只保最近 ~55min。
@@ -118,7 +107,7 @@ enum : uint8_t {
     ILOG_IMU  = 0x01,   // +16B: tms u32, ax ay az gx gy gz i16(raw)
     ILOG_GNSS = 0x02,   // +21B: tms, lat i32 1e7, lon i32 1e7, alt i16 m, spd u16 0.01m/s,
                         //       crs u16 0.1deg, hdop u8 x10, sats u8, flags u8(b0=valid)
-    ILOG_FUSE = 0x03,   // +13B: tms, lat i32, lon i32, mode u8(1=LATCH 2=DR)
+    ILOG_FUSE = 0x03,   // +13B: tms, lat i32, lon i32, mode u8(v2: 1=FIX 2=COAST；v1 旧义 1=LATCH 2=DR)
     ILOG_EVT  = 0x04,   // + 9B: tms, code u8, val f32
     ILOG_BIAS = 0x05,   // +16B: tms, bx by bz f32 (dps)
     ILOG_TIME = 0x06,   // + 8B: tms, epoch u32 (UTC, 由 RMC 日期时间换算)
@@ -133,6 +122,7 @@ struct IlRing {
     const char* seqKey;     // NVS 段序号键
     int         segMax;
     File        f;
+    char        name[28];   // 当前活动段路径（IMUDUMP 前关写句柄、之后以追加重开）
     uint32_t    curSize;
     uint8_t     buf[512];
     uint16_t    bufLen;
@@ -141,6 +131,7 @@ enum : uint8_t {        // ILOG_EVT 事件码
     EV_LATCH_ON = 1, EV_LATCH_OFF = 2, EV_LATCH_ESC = 3,
     EV_DR_ON = 4, EV_DR_OFF = 5 /*val=DR终点与回归定位的误差m*/, EV_DR_ABORT = 6,
     EV_BIAS_SET = 7, EV_IMU_FAIL = 8,
+    EV_IL_WFAIL = 9,   // val=累计写盘失败次数（0822 重复写 bug 追因：疑 NOSPC/CoW 失败重试）
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -205,14 +196,19 @@ static float imuAccStd();               // 最近统计块 |a| 标准差 m/s²
 static float imuGyroMag();              // 最近统计块 |ω-bias| 均值 dps
 static void  imuPrintStatus();          // console `imu`
 
-// ── fuse.ino ──
+// ── fuse.ino（v2：nav_core 估计器）──
 static void  fuseInit();
-static void  fusePumpChar(char c);      // GPS→link 整行泵（装配→按需改写→转发）
-static void  fuseTick(uint32_t now);    // $PFUSE + 与句流无关的状态维护
+static void  fusePumpChar(char c);      // GPS→link 整行泵（装配→估计器→改写→转发）
+static void  fuseTick(uint32_t now);    // $PFUSE 1Hz + 暂存 RMC 超时兜底
 static void  fuseSetEnabled(bool on);   // NVS 持久
 static bool  fuseEnabledGet();
-static bool  fuseIsLatched();
-static bool  fuseIsDr();
+static char  fuseModeGet();             // P=透传 F=跟踪 C=推算 N=本拍无点
+static float fuseStillGet();            // 停留信念 0..1
+static float fuseSigmaGet();            // 位置 1σ 米
+static bool  fuseStillLatched();        // still≥zuptOn 持续中（imulog 省流判据）
+static uint32_t fuseStillSince();
+static void  fuseImuBlock(float accStd, float headRateDps, uint32_t now);  // imu.ino 每 0.25s 块
+static void  fuseInjectLine(const char* line);  // 台面注入（$S3R,NMEA,…），开 3s 注入窗
 static void  fusePrintStatus();         // console `fuse`
 
 // ── imulog.ino ──
@@ -225,6 +221,8 @@ static void  imulogFuse(uint32_t tms, double lat, double lon, uint8_t mode);
 static void  imulogEvent(uint8_t code, float val);
 static void  imulogBias(const float b[3]);
 static void  imulogTimeMark(uint32_t epoch);
-static void  imulogStats(uint32_t* totalBytes, uint16_t* segs);
+static void  imulogStats(uint32_t* totalBytes, uint16_t* segs, uint16_t* sumSegs);
+static uint32_t imulogWriteFails();     // 累计写盘失败次数（遥测）
+static uint32_t imulogFreeKB();         // LittleFS 剩余 KB（遍历 FS，按需调用）
 static void  imulogClear();
 static void  imulogDump(Stream* io);    // $S3R,IMUDUMP 分块 ACK 传输（阻塞）
